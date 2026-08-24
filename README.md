@@ -2,14 +2,14 @@
 
 LinuxPty.NET is a Linux-only pseudoterminal (PTY) library for .NET 10. It ships native assets for glibc-based `linux-x64` and `linux-arm64`; musl assets are not provided.
 
-[![Linux CI](https://github.com/abp321/LinuxPty.NET/actions/workflows/build-linux.yml/badge.svg?branch=main)](https://github.com/abp321/LinuxPty.NET/actions/workflows/build-linux.yml)
+[![Publish package](https://github.com/abp321/LinuxPty.NET/actions/workflows/publish-package.yml/badge.svg?branch=main)](https://github.com/abp321/LinuxPty.NET/actions/workflows/publish-package.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 The NuGet package ID is `LinuxPty.NET`. The inherited public API remains in the `Porta.Pty` namespace.
 
 ## Status
 
-This is a pre-1.0 fork. Process spawning, resize, kill, disposal, environment handling, and stream behavior remain based on Porta.Pty.
+LinuxPty.NET publishes on the `1.0.x` package line. Process spawning, resize, kill, disposal, environment handling, and stream behavior remain based on Porta.Pty.
 
 The current PTY streams use blocking file descriptors. Despite the inherited `SpawnAsync` name, process creation is synchronous, the cancellation token is not observed, and stream async methods run over synchronous handles. The planned non-blocking and epoll-based I/O redesign is not implemented yet.
 
@@ -28,7 +28,7 @@ dotnet nuget add source \
 dotnet add package LinuxPty.NET --version VERSION --source github-abp321
 ```
 
-The first published preview was `0.1.0-preview.1`. It predates this Linux-only cleanup.
+Published versions are deterministic: each commit maps to `1.0.<repository commit count>`.
 
 ## Usage
 
@@ -69,7 +69,7 @@ dotnet restore LinuxPty.NET.slnx
 dotnet build LinuxPty.NET.slnx -c Release --no-restore
 ```
 
-The native build produces the asset for the machine it runs on. A distributable package requires both RID assets. The manual GitHub Packages workflow builds both architectures, validates their ELF and glibc contracts, packs the library, verifies the package contents, and then publishes with `GITHUB_TOKEN`.
+The native build produces the asset for the machine it runs on. A distributable package requires both RID assets. Every push to `main` runs the GitHub Packages workflow, which builds both architectures, validates their ELF and glibc contracts, packs the library, verifies the package contents, and then publishes with `GITHUB_TOKEN`. Manual workflow dispatch remains available; rerunning the same commit reuses its version and safely skips a package that already exists.
 
 ## Provenance and license
 

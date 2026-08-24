@@ -14,7 +14,6 @@
     <PackageTags>pty;linux;terminal;pseudoterminal;dotnet</PackageTags>
     <RepositoryUrl>https://github.com/abp321/LinuxPty.NET</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <Version>0.1.0</Version>
   </PropertyGroup>
 
   <PropertyGroup>
