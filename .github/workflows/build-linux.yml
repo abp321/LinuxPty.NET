@@ -85,19 +85,23 @@ jobs:
             exit 1
           fi
 
-          exports="$(LC_ALL=C nm -D --defined-only "$LIBRARY" |
-            awk '{print $3}' | sort)"
-          expected="$(printf '%s\n' \
-            pty_close \
-            pty_kill \
-            pty_resize \
-            pty_spawn \
-            pty_waitpid)"
-          printf 'Exported symbols:\n%s\n' "$exports"
-          if [[ "$exports" != "$expected" ]]; then
-            echo "Native PTY shim exports do not match the expected ABI." >&2
+          mapfile -t exports < <(
+            LC_ALL=C nm -D --defined-only "$LIBRARY" |
+              awk '{print $3}' | sort
+          )
+          expected=(pty_close pty_kill pty_resize pty_spawn pty_waitpid)
+          printf 'Exported symbols:\n'
+          printf '%s\n' "${exports[@]}"
+          if [[ ${#exports[@]} -ne ${#expected[@]} ]]; then
+            echo "Native PTY shim exports ${#exports[@]} symbols; expected ${#expected[@]}." >&2
             exit 1
           fi
+          for index in "${!expected[@]}"; do
+            if [[ "${exports[index]}" != "${expected[index]}" ]]; then
+              echo "Native export $index is '${exports[index]}'; expected '${expected[index]}'." >&2
+              exit 1
+            fi
+          done
 
           if LC_ALL=C readelf -d "$LIBRARY" | grep -Eq '(RPATH|RUNPATH)'; then
             echo "Native PTY shim must not contain RPATH or RUNPATH." >&2
@@ -229,7 +233,8 @@ jobs:
             extracted="$(mktemp)"
             unzip -p "$package" "$path" > "$extracted"
 
-            local header actual_class actual_machine versions maximum exports expected
+            local header actual_class actual_machine versions maximum
+            local -a exports expected
             header="$(LC_ALL=C readelf -h "$extracted")"
             actual_class="$(sed -n 's/^[[:space:]]*Class:[[:space:]]*//p' <<<"$header")"
             actual_machine="$(sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p' <<<"$header")"
@@ -253,19 +258,23 @@ jobs:
               exit 1
             fi
 
-            exports="$(LC_ALL=C nm -D --defined-only "$extracted" |
-              awk '{print $3}' | sort)"
-            expected="$(printf '%s\n' \
-              pty_close \
-              pty_kill \
-              pty_resize \
-              pty_spawn \
-              pty_waitpid)"
-            printf '%s: exported symbols:\n%s\n' "$path" "$exports"
-            if [[ "$exports" != "$expected" ]]; then
-              echo "Packaged asset $path exports do not match the expected ABI." >&2
+            mapfile -t exports < <(
+              LC_ALL=C nm -D --defined-only "$extracted" |
+                awk '{print $3}' | sort
+            )
+            expected=(pty_close pty_kill pty_resize pty_spawn pty_waitpid)
+            printf '%s: exported symbols:\n' "$path"
+            printf '%s\n' "${exports[@]}"
+            if [[ ${#exports[@]} -ne ${#expected[@]} ]]; then
+              echo "Packaged asset $path exports ${#exports[@]} symbols; expected ${#expected[@]}." >&2
               exit 1
             fi
+            for index in "${!expected[@]}"; do
+              if [[ "${exports[index]}" != "${expected[index]}" ]]; then
+                echo "Packaged export $index is '${exports[index]}'; expected '${expected[index]}'." >&2
+                exit 1
+              fi
+            done
 
             if LC_ALL=C readelf -d "$extracted" | grep -Eq '(RPATH|RUNPATH)'; then
               echo "Packaged native PTY shim must not contain RPATH or RUNPATH." >&2
