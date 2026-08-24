@@ -6,21 +6,21 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <PropertyGroup>
-    <Description>Cross platform (windows/linux/macos) Pty library for communicating with console applications. Uses native shim for .NET 7+ compatibility (no DOTNET_EnableWriteXorExecute required).</Description>
-    <Company>Iciclecreek</Company>
-    <Authors>Tom Laird-McConnell</Authors>
+    <PackageId>LinuxPty.NET</PackageId>
+    <Title>LinuxPty.NET</Title>
+    <Description>Linux-focused pseudoterminal (PTY) library for .NET, derived from Porta.Pty and intended for modern Linux-specific optimization.</Description>
+    <Authors>abp321;Tom Laird-McConnell</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/tomlm/Porta.Pty</PackageProjectUrl>
-    <PackageIconUrl>https://raw.githubusercontent.com/tomlm/Porta.Pty/master/icon.png</PackageIconUrl>
-    <PackageIcon>icon.png</PackageIcon>
+    <PackageProjectUrl>https://github.com/abp321/LinuxPty.NET</PackageProjectUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
-    <RepositoryUrl>https://github.com/tomlm/Porta.Pty</RepositoryUrl>
-    <Copyright>Tom Laird-McConnell All Rights Reserved</Copyright>
-    <Version>2.0.1</Version>
-    <AssemblyVersion>2.0.1.0</AssemblyVersion>
+    <RepositoryUrl>https://github.com/abp321/LinuxPty.NET</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <Copyright>Copyright (c) 2025 Tom Laird-McConnell; modifications copyright (c) 2026 abp321</Copyright>
+    <Version>0.1.0</Version>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
     <RootNamespace>Porta.Pty</RootNamespace>
-    <PackageTags>pty;conpty;ptty</PackageTags>
+    <PackageTags>pty;linux;terminal;pseudoterminal;dotnet</PackageTags>
     <ContentTargetFolders>content</ContentTargetFolders>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
@@ -50,7 +50,7 @@
 
   <ItemGroup>
     <None Include="../../README.md" Pack="true" PackagePath="" />
-    <None Include="../../icon.png" Pack="true" PackagePath="" />
+    <None Include="../../LICENSE" Pack="true" PackagePath="" />
   </ItemGroup>
 
   <PropertyGroup>

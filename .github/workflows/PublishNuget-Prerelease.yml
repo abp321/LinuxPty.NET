@@ -1,31 +1,15 @@
-name: Publish Nuget Prerelease
-
-# A clone of PublishNuget.yml that publishes the SAME build under a prerelease version, so a package
-# can be consumed for real -- restored from nuget.org, resolved through runtimes/, staged through
-# buildTransitive/ -- before the version consumers get is spent.
-#
-# That gap is worth closing here specifically: the test suite references the library by PROJECT and so
-# cannot observe any packaging behaviour at all. scripts/verify-consumer.sh and
-# Verify-ConPtyConsumerStaging.ps1 close most of it from a LOCAL feed; a prerelease closes the rest.
-#
-# The only differences from PublishNuget.yml are the version and fail-if-exists. Everything else is
-# deliberately identical, because a prerelease that is built differently from the release is not a
-# test of the release.
-#
-# The version auto-increments -- 2.0.0-rc001, rc002, ... -- so this can be run as many times as it
-# takes without picking a number by hand or colliding with one already spent.
+name: Publish LinuxPty.NET prerelease
 
 on:
   workflow_dispatch:
     inputs:
       label:
-        description: 'Prerelease label. The counter is per-label and advances on its own (2.0.0 -> 2.0.0-rc001, rc002, ...)'
+        description: 'Prerelease label. The counter advances automatically (0.1.0-rc001, rc002, ...)'
         required: true
         default: 'rc'
         type: string
 
 jobs:
-  # Build native shim on Linux x64
   build-native-linux-x64:
     runs-on: ubuntu-latest
     steps:
@@ -49,7 +33,6 @@ jobs:
           name: native-linux-x64
           path: src/Porta.Pty.Native/output/runtimes/linux-x64/native/libporta_pty.so
 
-  # Build native shim on Linux ARM64
   build-native-linux-arm64:
     runs-on: ubuntu-24.04-arm
     steps:
@@ -73,14 +56,14 @@ jobs:
           name: native-linux-arm64
           path: src/Porta.Pty.Native/output/runtimes/linux-arm64/native/libporta_pty.so
 
-  # Build native shim on macOS (builds BOTH x64 and arm64 via cross-compilation)
+  # Retained while the initial fork still carries the upstream macOS implementation.
   build-native-macos:
     runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build native PTY shim (both architectures)
+      - name: Build native PTY shim
         run: |
           cd src/Porta.Pty.Native
           chmod +x build.sh
@@ -98,7 +81,6 @@ jobs:
           name: native-osx-x64
           path: src/Porta.Pty.Native/output/runtimes/osx-x64/native/libporta_pty.dylib
 
-  # Package and publish NuGet
   package-and-publish:
     runs-on: ubuntu-latest
     needs:
@@ -114,7 +96,6 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
-      # Download all native libraries
       - name: Download Linux x64 native library
         uses: actions/download-artifact@v4
         with:
@@ -139,48 +120,27 @@ jobs:
           name: native-osx-x64
           path: src/Porta.Pty.Native/output/runtimes/osx-x64/native/
 
-      - name: List native libraries
-        run: |
-          echo "Native libraries included in package:"
-          find src/Porta.Pty.Native/output/runtimes -type f -name "*.so" -o -name "*.dylib"
-
-      # The base version is READ from the csproj rather than taken as an input, so a prerelease can
-      # never be published for a version the branch does not actually declare -- which is the one way
-      # a "test the package before the real push" step could test the wrong thing entirely.
-      #
-      # The counter comes from nuget.org rather than from github.run_number, which would skip and
-      # would restart at nothing to do with the versions actually published. The question being asked
-      # is "what is the next unused 2.0.0-rc*", and only nuget.org knows that.
-      #
-      # rc001, NOT rc.001. SemVer forbids leading zeroes in a DOTTED numeric identifier, and NuGet
-      # enforces it: `2.0.0-rc.001` fails to pack outright with "is not a valid version string".
-      # Without the dot the whole label is one alphanumeric identifier, which is legal and which also
-      # keeps the padding meaningful -- these sort lexically, so rc009 < rc010 only because of it.
       - name: Compute the next prerelease version
         id: version
         run: |
           set -euo pipefail
           label='${{ inputs.label }}'
 
-          # Must not END in a digit, or the label and the counter run together and the next lookup
-          # cannot tell where one stops: rc1 + 002 is rc1002, which reads back as label rc, counter
-          # 1002. Rejecting here beats discovering it two prereleases later.
           if ! printf '%s' "$label" | grep -qE '^[0-9A-Za-z-]*[A-Za-z-]$'; then
-            echo "::error::'$label' must be alphanumerics or hyphens and must not end in a digit"
+            echo "::error::'$label' must contain only alphanumerics or hyphens and must not end in a digit"
             exit 1
           fi
 
           csproj=src/Porta.Pty/Porta.Pty.csproj
           base=$(grep -oP '(?<=<Version>)[^<]+' "$csproj" | head -1)
-          if [ -z "$base" ]; then
-            echo "::error::no <Version> element in $csproj"
+          package_id=$(grep -oP '(?<=<PackageId>)[^<]+' "$csproj" | head -1)
+          if [ -z "$base" ] || [ -z "$package_id" ]; then
+            echo "::error::PackageId or Version is missing from $csproj"
             exit 1
           fi
 
-          # Flat container, which lists every version of the id in lowercase. A 404 means the id has
-          # never been published at all, which is a legitimate answer of "none". Anything else is the
-          # API failing, and guessing 001 through a failed lookup would republish over real versions.
-          index="https://api.nuget.org/v3-flatcontainer/porta.pty/index.json"
+          flat_id=$(printf '%s' "$package_id" | tr '[:upper:]' '[:lower:]')
+          index="https://api.nuget.org/v3-flatcontainer/$flat_id/index.json"
           status=$(curl -sS -o versions.json -w '%{http_code}' "$index" || echo 000)
 
           case "$status" in
@@ -189,9 +149,6 @@ jobs:
             *) echo "::error::nuget.org returned $status for $index"; exit 1 ;;
           esac
 
-          # Prefix match plus an all-digits tail, rather than a regex built out of $base -- the base
-          # version contains dots, and the escaping is one more thing to get wrong silently. Unlisted
-          # versions are still listed here, which is correct: they occupy the number either way.
           prefix="$base-$label"
           latest=$(jq -r '.versions[]' versions.json \
             | awk -v p="$prefix" 'index($0, p) == 1 {
@@ -200,46 +157,33 @@ jobs:
                 }' \
             | sort -n | tail -1)
 
-          # 10# forces base 10. Without it $(( 008 + 1 )) is a fatal "value too great for base",
-          # because the padding that makes these sort makes them look octal to the shell.
           next=$(printf '%03d' "$(( 10#${latest:-0} + 1 ))")
-
-          echo "version=$prefix$next" >> "$GITHUB_OUTPUT"
-          echo "release version in $csproj: $base"
-          echo "highest published $prefix*: ${latest:-none}"
-          echo "publishing: $prefix$next"
+          version="$prefix$next"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "package_id=$package_id" >> "$GITHUB_OUTPUT"
+          echo "publishing: $package_id $version"
 
       - name: Restore dependencies
         run: dotnet restore src/Porta.Pty.sln
 
-      # PackageVersion, NOT Version: it moves the package version alone and leaves AssemblyVersion and
-      # FileVersion where the csproj put them, so the prerelease assembly is binary-identical to the
-      # release one. Version would drag all three along and make them different builds -- which would
-      # mean the thing being tested is not the thing being shipped.
-      #
-      # Passed to BUILD as well as pack, because GeneratePackageOnBuild is on: the build produces a
-      # package too, and `pack --no-build` reuses what the build laid down. Passing it to only one of
-      # the two is how the two disagree.
       - name: Build
-        run: dotnet build src/Porta.Pty.sln -c Release --no-restore -p:PackageVersion=${{ steps.version.outputs.version }}
+        run: dotnet build src/Porta.Pty.sln -c Release --no-restore --property WarningLevel=0 -p:PackageVersion=${{ steps.version.outputs.version }}
 
-      - name: dotnet pack
+      - name: Pack LinuxPty.NET prerelease
+        run: dotnet pack --no-build src/Porta.Pty.sln -c Release -o packages --include-symbols --property WarningLevel=0 -p:PackageVersion=${{ steps.version.outputs.version }}
+
+      - name: Verify package identity and contents
         run: |
-          dotnet pack --no-build src/Porta.Pty.sln -c Release -o packages --include-symbols --property WarningLevel=0 -p:PackageVersion=${{ steps.version.outputs.version }}
+          set -euo pipefail
+          package=$(find packages -maxdepth 1 -type f -name 'LinuxPty.NET.*.nupkg' | head -1)
+          [ -n "$package" ] || { echo "::error::LinuxPty.NET package was not produced"; ls -la packages; exit 1; }
+          listing=$(unzip -l "$package")
+          echo "$listing"
+          grep -q 'README.md' <<<"$listing" || { echo "::error::README.md is missing from the package"; exit 1; }
+          grep -q 'LICENSE' <<<"$listing" || { echo "::error::LICENSE is missing from the package"; exit 1; }
+          grep -q 'runtimes/linux-x64/native/libporta_pty.so' <<<"$listing" || { echo "::error::linux-x64 shim is missing"; exit 1; }
+          grep -q 'runtimes/linux-arm64/native/libporta_pty.so' <<<"$listing" || { echo "::error::linux-arm64 shim is missing"; exit 1; }
 
-      - name: List package contents
-        run: |
-          echo "Packages:"
-          ls -l packages
-          echo "Package contents:"
-          unzip -l packages/*.nupkg | grep -E "(runtimes|\.so|\.dylib)"
-
-      # fail-if-exists is TRUE here, where PublishNuget.yml has it false, and the difference matters
-      # precisely because this workflow picks its own version. The counter is read from nuget.org, and
-      # nuget.org takes a minute or two to index a push -- so two runs in quick succession can both
-      # compute the same number. Swallowing that would report a successful publish of a package that
-      # was never uploaded, and the whole point here is to test what actually got published. Failing
-      # loudly costs a re-run, by which time the index has caught up.
       - name: Publish NuGet and symbols
         id: nuget-push
         uses: edumserrano/nuget-push@v1
@@ -252,13 +196,9 @@ jobs:
         run: |
           version='${{ steps.version.outputs.version }}'
           {
-            echo "### Published \`Porta.Pty $version\`"
+            echo "### Published \`LinuxPty.NET $version\`"
             echo
-            echo "Consume it with an explicit version -- NuGet does not resolve prereleases otherwise:"
+            echo '```bash'
+            echo "dotnet add package LinuxPty.NET --version $version"
             echo '```'
-            echo "dotnet add package Porta.Pty --version $version"
-            echo '```'
-            echo
-            echo "The next run of this workflow takes the next number on its own. It may need a minute"
-            echo "or two first: the counter comes from nuget.org, which does not index a push instantly."
           } >> "$GITHUB_STEP_SUMMARY"

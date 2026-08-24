@@ -28,7 +28,7 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(PortaPtyPackageVersion)' != ''">
-    <PackageReference Include="Porta.Pty" Version="$(PortaPtyPackageVersion)" />
+    <PackageReference Include="LinuxPty.NET" Version="$(PortaPtyPackageVersion)" />
   </ItemGroup>
 
 </Project>

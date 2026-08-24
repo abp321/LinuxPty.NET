@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verifies that a NuGet CONSUMER of Porta.Pty works end to end on Linux/macOS.
+# Verifies that a NuGet CONSUMER of LinuxPty.NET works end to end on Linux/macOS.
 #
 # The test suite cannot answer this. It references the library by project, which bypasses the .nupkg
 # entirely: native assets are not resolved through runtimes/, buildTransitive/ never applies, and any
@@ -10,8 +10,8 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-version="${1:-1.0.0-verify}"
-scratch="$(mktemp -d "${TMPDIR:-/tmp}/portapty-verify-XXXXXX")"
+version="${1:-0.1.0-verify}"
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/linuxpty-verify-XXXXXX")"
 trap 'rm -rf "$scratch"' EXIT
 
 feed="$scratch/feed"
@@ -22,7 +22,7 @@ mkdir -p "$feed"
 # then packs whatever is already in bin/Release -- and CI builds Debug, so there is nothing there:
 #   NU5026: The file '.../bin/Release/net10.0/Porta.Pty.dll' to be packed was not found on disk.
 # It passes locally after any Release build, which is exactly what makes it a CI-only failure.
-echo ">> packing Porta.Pty $version"
+echo ">> packing LinuxPty.NET $version"
 dotnet pack "$repo/src/Porta.Pty/Porta.Pty.csproj" -c Release -o "$feed" \
     -p:Version="$version" -p:GeneratePackageOnBuild=false --nologo -v q
 
@@ -33,7 +33,7 @@ echo ">> checking the package carries a native shim"
 # Listed once into a variable, deliberately. `unzip -l ... | grep -q` under `set -o pipefail` reports
 # failure even on a match: grep -q exits at the first hit, unzip takes SIGPIPE, and pipefail propagates
 # that. The check then "fails" on a perfectly good package.
-listing="$(unzip -l "$feed/Porta.Pty.$version.nupkg")"
+listing="$(unzip -l "$feed/LinuxPty.NET.$version.nupkg")"
 if ! printf '%s\n' "$listing" | grep -E 'runtimes/(linux|osx)-[a-z0-9]+/native/libporta_pty\.(so|dylib)'; then
     echo "::error::the packed library contains no POSIX shim - did src/Porta.Pty.Native/build.sh run?"
     printf '%s\n' "$listing" | sed 's/^/    /'
@@ -72,13 +72,9 @@ dotnet build "$demo" \
 echo ">> running the demo"
 "$out/Porta.Pty.Demo"
 
-# Again with NO RuntimeIdentifier. Porta.Pty must be consumable from a RID-independent project — a
-# library that forces every consumer to pin a RID is not a portable library — and on this platform that
-# claim is fully testable: the POSIX shim resolves through deps.json from runtimes/<rid>/native/ with no
-# flattening. (The Windows equivalent — whether conpty.dll finds its host beside itself in that layout —
-# was settled by process census on Windows ARM64: OpenConsole.exe in the tree by default, conhost.exe
-# with PORTAPTY_CONPTY=inbox as the control. scripts/Verify-ConPtyHost.ps1 -NoRid is that check, kept as
-# a regression guard since nothing in the ConPTY package documents the rule it relies on.)
+# Again with NO RuntimeIdentifier. The package must be consumable from a RID-independent project on
+# the current platform, and this checks the native shim resolves through runtimes/<rid>/native/ with no
+# consumer-side copy step.
 #
 # UseCurrentRuntimeIdentifier is turned off explicitly: the sample sets it so a plain `dotnet run` is
 # honest about what a consumer gets, and it would otherwise quietly reintroduce a RID here.

@@ -1,14 +1,13 @@
-name: Publish Nuget
+name: Publish LinuxPty.NET
 
 on:
   workflow_dispatch:
 
 jobs:
-  # Build native shim on Linux x64
   build-native-linux-x64:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout 
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install native build dependencies
@@ -28,11 +27,10 @@ jobs:
           name: native-linux-x64
           path: src/Porta.Pty.Native/output/runtimes/linux-x64/native/libporta_pty.so
 
-  # Build native shim on Linux ARM64
   build-native-linux-arm64:
     runs-on: ubuntu-24.04-arm
     steps:
-      - name: Checkout 
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install native build dependencies
@@ -52,14 +50,15 @@ jobs:
           name: native-linux-arm64
           path: src/Porta.Pty.Native/output/runtimes/linux-arm64/native/libporta_pty.so
 
-  # Build native shim on macOS (builds BOTH x64 and arm64 via cross-compilation)
+  # Retained while the initial fork still carries the upstream macOS implementation. This job can be
+  # removed with the macOS code when LinuxPty.NET completes its Linux-only specialization.
   build-native-macos:
     runs-on: macos-latest
     steps:
-      - name: Checkout 
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build native PTY shim (both architectures)
+      - name: Build native PTY shim
         run: |
           cd src/Porta.Pty.Native
           chmod +x build.sh
@@ -77,23 +76,21 @@ jobs:
           name: native-osx-x64
           path: src/Porta.Pty.Native/output/runtimes/osx-x64/native/libporta_pty.dylib
 
-  # Package and publish NuGet
   package-and-publish:
     runs-on: ubuntu-latest
-    needs: 
+    needs:
       - build-native-linux-x64
       - build-native-linux-arm64
       - build-native-macos
     steps:
-      - name: Checkout 
+      - name: Checkout
         uses: actions/checkout@v4
-  
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
 
-      # Download all native libraries
       - name: Download Linux x64 native library
         uses: actions/download-artifact@v4
         with:
@@ -118,30 +115,32 @@ jobs:
           name: native-osx-x64
           path: src/Porta.Pty.Native/output/runtimes/osx-x64/native/
 
-      - name: List native libraries
-        run: |
-          echo "Native libraries included in package:"
-          find src/Porta.Pty.Native/output/runtimes -type f -name "*.so" -o -name "*.dylib"
-
       - name: Restore dependencies
         run: dotnet restore src/Porta.Pty.sln
 
       - name: Build
-        run: dotnet build src/Porta.Pty.sln -c Release --no-restore 
-  
-      - name: dotnet pack 
-        run: |
-          dotnet pack --no-build src/Porta.Pty.sln -c Release -o packages --include-symbols --property WarningLevel=0
+        run: dotnet build src/Porta.Pty.sln -c Release --no-restore --property WarningLevel=0
 
-      - name: List package contents
+      - name: Pack LinuxPty.NET
+        run: dotnet pack --no-build src/Porta.Pty.sln -c Release -o packages --include-symbols --property WarningLevel=0
+
+      - name: Verify package identity and contents
         run: |
-          echo "Package contents:"
-          unzip -l packages/*.nupkg | grep -E "(runtimes|\.so|\.dylib)"
+          set -euo pipefail
+          package=$(find packages -maxdepth 1 -type f -name 'LinuxPty.NET.*.nupkg' | head -1)
+          [ -n "$package" ] || { echo "::error::LinuxPty.NET package was not produced"; ls -la packages; exit 1; }
+          echo "Package: $package"
+          listing=$(unzip -l "$package")
+          echo "$listing"
+          grep -q 'README.md' <<<"$listing" || { echo "::error::README.md is missing from the package"; exit 1; }
+          grep -q 'LICENSE' <<<"$listing" || { echo "::error::LICENSE is missing from the package"; exit 1; }
+          grep -q 'runtimes/linux-x64/native/libporta_pty.so' <<<"$listing" || { echo "::error::linux-x64 shim is missing"; exit 1; }
+          grep -q 'runtimes/linux-arm64/native/libporta_pty.so' <<<"$listing" || { echo "::error::linux-arm64 shim is missing"; exit 1; }
 
       - name: Publish NuGet and symbols
         id: nuget-push
         uses: edumserrano/nuget-push@v1
         with:
-          api-key: '${{ secrets.NUGET_KEY }}' 
+          api-key: '${{ secrets.NUGET_KEY }}'
           working-directory: 'packages'
           fail-if-exists: false
