@@ -1,7 +1,15 @@
 {
     global:
         pty_close;
+        pty_configure_master;
+        pty_io_read;
+        pty_io_write;
         pty_kill;
+        pty_reactor_control;
+        pty_reactor_create;
+        pty_reactor_drain;
+        pty_reactor_wait;
+        pty_reactor_wake;
         pty_resize;
         pty_spawn;
         pty_waitpid;

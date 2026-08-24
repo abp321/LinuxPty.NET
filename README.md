@@ -9,9 +9,11 @@ The NuGet package ID is `LinuxPty.NET`. The inherited public API remains in the 
 
 ## Status
 
-LinuxPty.NET publishes on the `1.0.x` package line. Process spawning, resize, kill, disposal, environment handling, and stream behavior remain based on Porta.Pty.
+LinuxPty.NET publishes on the `1.0.x` package line. Process spawning, resize, kill, disposal, and environment handling remain based on Porta.Pty.
 
-The current PTY streams use blocking file descriptors. Despite the inherited `SpawnAsync` name, process creation is synchronous, the cancellation token is not observed, and stream async methods run over synchronous handles. The planned non-blocking and epoll-based I/O redesign is not implemented yet.
+PTY stream I/O is non-blocking and readiness-driven on Linux. All connections in a process share one epoll reactor and one reactor thread; pending asynchronous reads and writes do not occupy blocked ThreadPool workers. Synchronous `Stream` methods still block their caller by definition. Despite the inherited `SpawnAsync` name, process creation itself remains synchronous and its cancellation token is not observed.
+
+Reads and writes are queued FIFO per connection. Cancellation wakes the reactor promptly. If a write is cancelled after the kernel accepted part of it, those bytes cannot be rolled back; the remaining bytes are not written.
 
 ## Installation
 
@@ -34,6 +36,7 @@ Published versions are deterministic: each commit maps to `1.0.<repository commi
 
 ```csharp
 using System;
+using System.Text;
 using System.Threading;
 using Porta.Pty;
 
@@ -50,13 +53,12 @@ using IPtyConnection terminal = await PtyProvider.SpawnAsync(
     options,
     CancellationToken.None);
 
-byte[] command = System.Text.Encoding.UTF8.GetBytes("echo hello\r");
-terminal.WriterStream.Write(command);
-terminal.WriterStream.Flush();
+byte[] command = Encoding.UTF8.GetBytes("echo hello\r");
+await terminal.WriterStream.WriteAsync(command);
 
 byte[] buffer = new byte[4096];
-int count = terminal.ReaderStream.Read(buffer);
-Console.WriteLine(System.Text.Encoding.UTF8.GetString(buffer, 0, count));
+int count = await terminal.ReaderStream.ReadAsync(buffer);
+Console.WriteLine(Encoding.UTF8.GetString(buffer, 0, count));
 ```
 
 ## Building

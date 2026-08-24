@@ -6,6 +6,7 @@ namespace Porta.Pty.Linux
     using System;
     using System.Collections.Generic;
     using System.Linq;
+    using System.Runtime.InteropServices;
     using static Porta.Pty.Linux.NativeMethods;
 
     /// <summary>
@@ -73,7 +74,25 @@ namespace Porta.Pty.Linux
                     + $"({GetErrorMessage(result.Error)}), masterFd={result.MasterFd}, pid={result.Pid}");
             }
 
-            return new PtyConnection(result.MasterFd, result.Pid);
+            PtyIoContext? ioContext = null;
+            try
+            {
+                int configureError = pty_configure_master(result.MasterFd);
+                if (configureError != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Configuring PTY master fd {result.MasterFd} as non-blocking failed: "
+                        + $"error={configureError} ({GetErrorMessage(configureError)}).");
+                }
+
+                ioContext = PtyIoContext.Create(result.MasterFd);
+                return new PtyConnection(result.MasterFd, result.Pid, ioContext);
+            }
+            catch
+            {
+                CleanupFailedConnection(result.MasterFd, result.Pid, ioContext);
+                throw;
+            }
         }
 
         private static string?[] GetExecvpArgs(PtyOptions options)
@@ -97,6 +116,53 @@ namespace Porta.Pty.Linux
             }
 
             return new System.ComponentModel.Win32Exception(errno).Message;
+        }
+
+        private static void CleanupFailedConnection(
+            int masterFd,
+            int pid,
+            PtyIoContext? ioContext)
+        {
+            try
+            {
+                ioContext?.Stop();
+            }
+            catch
+            {
+                // The setup exception remains the useful failure.
+            }
+
+            try
+            {
+                pty_kill(pid, SIGKILL);
+            }
+            catch
+            {
+                // Continue with descriptor cleanup and reaping.
+            }
+
+            try
+            {
+                // Never retry close after EINTR because Linux may already have reused the fd.
+                pty_close(masterFd);
+            }
+            catch
+            {
+                // Continue reaping the child.
+            }
+
+            try
+            {
+                int status = 0;
+                while (pty_waitpid(pid, ref status, 0) == -1
+                    && Marshal.GetLastWin32Error() == 4)
+                {
+                }
+            }
+            catch
+            {
+                // Cleanup must not replace the original setup exception.
+            }
         }
     }
 }

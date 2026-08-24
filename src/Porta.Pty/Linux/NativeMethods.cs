@@ -10,6 +10,16 @@ namespace Porta.Pty.Linux
     internal static class NativeMethods
     {
         internal const int SIGHUP = 1;
+        internal const int SIGKILL = 9;
+
+        internal const int ReactorAdd = 1;
+        internal const int ReactorModify = 2;
+        internal const int ReactorDelete = 3;
+
+        internal const uint ReactorRead = 1;
+        internal const uint ReactorWrite = 2;
+        internal const uint ReactorError = 4;
+        internal const uint ReactorHangup = 8;
 
         private const string LibPortaPty = "libporta_pty";
 
@@ -81,6 +91,19 @@ namespace Porta.Pty.Linux
             public int MasterFd;
             public int Pid;
             public int Error;
+        }
+
+        [StructLayout(LayoutKind.Explicit, Size = 16)]
+        internal struct PtyReactorEvent
+        {
+            [FieldOffset(0)]
+            public ulong Token;
+
+            [FieldOffset(8)]
+            public uint Events;
+
+            [FieldOffset(12)]
+            public uint Reserved;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -157,5 +180,49 @@ namespace Porta.Pty.Linux
 
         [DllImport(LibPortaPty, SetLastError = true)]
         internal static extern int pty_close(int masterFd);
+
+        [DllImport(LibPortaPty)]
+        internal static extern int pty_configure_master(int masterFd);
+
+        [DllImport(LibPortaPty)]
+        internal static extern int pty_reactor_create(
+            ulong wakeToken,
+            out int epollFd,
+            out int wakeFd);
+
+        [DllImport(LibPortaPty)]
+        internal static extern int pty_reactor_control(
+            int epollFd,
+            int operation,
+            int monitoredFd,
+            ulong token,
+            uint interests);
+
+        [DllImport(LibPortaPty)]
+        internal static extern int pty_reactor_wait(
+            int epollFd,
+            [Out] PtyReactorEvent[] events,
+            int capacity,
+            out int count);
+
+        [DllImport(LibPortaPty)]
+        internal static extern int pty_reactor_wake(int wakeFd);
+
+        [DllImport(LibPortaPty)]
+        internal static extern int pty_reactor_drain(int wakeFd);
+
+        [DllImport(LibPortaPty)]
+        internal static extern int pty_io_read(
+            int masterFd,
+            IntPtr buffer,
+            int length,
+            out int transferred);
+
+        [DllImport(LibPortaPty)]
+        internal static extern int pty_io_write(
+            int masterFd,
+            IntPtr buffer,
+            int length,
+            out int transferred);
     }
 }

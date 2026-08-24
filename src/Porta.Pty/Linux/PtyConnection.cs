@@ -20,16 +20,21 @@ namespace Porta.Pty.Linux
 
         private readonly int controller;
         private readonly int pid;
+        private readonly PtyIoContext ioContext;
+        private readonly PtyStream readerStream;
+        private readonly PtyStream writerStream;
+        private readonly object lifetimeGate = new();
         private readonly ManualResetEvent terminalProcessTerminatedEvent = new ManualResetEvent(false);
         private int exitCode;
         private bool isDisposed;
 
-        public PtyConnection(int controller, int pid)
+        public PtyConnection(int controller, int pid, PtyIoContext ioContext)
         {
-            this.ReaderStream = new PtyStream(controller, FileAccess.Read);
-            this.WriterStream = new PtyStream(controller, FileAccess.Write);
             this.controller = controller;
             this.pid = pid;
+            this.ioContext = ioContext;
+            this.readerStream = new PtyStream(ioContext, FileAccess.Read);
+            this.writerStream = new PtyStream(ioContext, FileAccess.Write);
 
             var childWatcherThread = new Thread(this.ChildWatcherThreadProc)
             {
@@ -43,9 +48,9 @@ namespace Porta.Pty.Linux
 
         public event EventHandler<PtyExitedEventArgs>? ProcessExited;
 
-        public Stream ReaderStream { get; }
+        public Stream ReaderStream => this.readerStream;
 
-        public Stream WriterStream { get; }
+        public Stream WriterStream => this.writerStream;
 
         public int Pid => this.pid;
 
@@ -53,38 +58,51 @@ namespace Porta.Pty.Linux
 
         public void Dispose()
         {
-            if (this.isDisposed)
+            lock (this.lifetimeGate)
             {
-                return;
+                if (this.isDisposed)
+                {
+                    return;
+                }
+
+                this.isDisposed = true;
+                this.readerStream.MarkDisposedByConnection();
+                this.writerStream.MarkDisposedByConnection();
+
+                // Retirement is acknowledged before close, so the reactor can no longer
+                // issue a syscall against a descriptor that Linux may immediately reuse.
+                this.ioContext.Stop();
+                this.TryKill();
+                this.TryClose();
             }
-
-            this.isDisposed = true;
-            this.ReaderStream.Dispose();
-            this.WriterStream.Dispose();
-
-            // Both streams wrap the same non-owning fd. Kill first, then close it exactly once here.
-            this.TryKill();
-            this.TryClose();
         }
 
         public void Kill()
         {
-            if (pty_kill(this.pid, SIGHUP) == -1)
+            lock (this.lifetimeGate)
             {
-                int errno = Marshal.GetLastWin32Error();
-                if (errno != ESRCH)
+                ObjectDisposedException.ThrowIf(this.isDisposed, this);
+                if (pty_kill(this.pid, SIGHUP) == -1)
                 {
-                    throw new InvalidOperationException($"Killing terminal failed with error {errno}");
+                    int errno = Marshal.GetLastWin32Error();
+                    if (errno != ESRCH)
+                    {
+                        throw new InvalidOperationException($"Killing terminal failed with error {errno}");
+                    }
                 }
             }
         }
 
         public void Resize(int cols, int rows)
         {
-            if (pty_resize(this.controller, (ushort)rows, (ushort)cols) == -1)
+            lock (this.lifetimeGate)
             {
-                throw new InvalidOperationException(
-                    $"Resizing terminal failed with error {Marshal.GetLastWin32Error()}");
+                ObjectDisposedException.ThrowIf(this.isDisposed, this);
+                if (pty_resize(this.controller, (ushort)rows, (ushort)cols) == -1)
+                {
+                    throw new InvalidOperationException(
+                        $"Resizing terminal failed with error {Marshal.GetLastWin32Error()}");
+                }
             }
         }
 
@@ -97,7 +115,11 @@ namespace Porta.Pty.Linux
         {
             try
             {
-                this.Kill();
+                if (pty_kill(this.pid, SIGHUP) == -1
+                    && Marshal.GetLastWin32Error() != ESRCH)
+                {
+                    throw new InvalidOperationException("Killing terminal failed during cleanup.");
+                }
             }
             catch
             {
