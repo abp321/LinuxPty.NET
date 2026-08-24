@@ -52,8 +52,10 @@ if [[ ! -f "$library" ]]; then
     exit 1
 fi
 
-elf_class="$(readelf -h "$library" | awk -F: '/Class:/{sub(/^[[:space:]]+/, "", $2); print $2}')"
-machine="$(readelf -h "$library" | awk -F: '/Machine:/{sub(/^[[:space:]]+/, "", $2); print $2}')"
+elf_class="$(readelf -h "$library" |
+    sed -n 's/^[[:space:]]*Class:[[:space:]]*//p')"
+machine="$(readelf -h "$library" |
+    sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
 if [[ "$elf_class" != "ELF64" || "$machine" != "$expected_machine" ]]; then
     echo "Unexpected native asset: class='$elf_class', machine='$machine'." >&2
     exit 1
