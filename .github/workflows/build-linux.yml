@@ -87,7 +87,7 @@ jobs:
 
           mapfile -t exports < <(
             LC_ALL=C nm -D --defined-only "$LIBRARY" |
-              awk '{print $3}' | sort
+              awk 'NF >= 3 {print $3}' | sort
           )
           expected=(pty_close pty_kill pty_resize pty_spawn pty_waitpid)
           printf 'Exported symbols:\n'
@@ -260,7 +260,7 @@ jobs:
 
             mapfile -t exports < <(
               LC_ALL=C nm -D --defined-only "$extracted" |
-                awk '{print $3}' | sort
+                awk 'NF >= 3 {print $3}' | sort
             )
             expected=(pty_close pty_kill pty_resize pty_spawn pty_waitpid)
             printf '%s: exported symbols:\n' "$path"
