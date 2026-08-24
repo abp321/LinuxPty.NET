@@ -63,15 +63,27 @@ jobs:
           set -euo pipefail
 
           header="$(LC_ALL=C readelf -h "$LIBRARY")"
-          grep -q 'Class:.*ELF64' <<<"$header"
-          grep -q "Machine:.*$EXPECTED_MACHINE" <<<"$header"
+          actual_class="$(sed -n 's/^[[:space:]]*Class:[[:space:]]*//p' <<<"$header")"
+          actual_machine="$(sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p' <<<"$header")"
+          printf 'ELF class: %s\nELF machine: %s\n' "$actual_class" "$actual_machine"
+          if [[ "$actual_class" != ELF64 || "$actual_machine" != "$EXPECTED_MACHINE" ]]; then
+            echo "Unexpected ELF header for $LIBRARY." >&2
+            exit 1
+          fi
 
           versions="$(LC_ALL=C readelf --version-info "$LIBRARY" |
             grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' || true)"
-          test -n "$versions"
+          if [[ -z "$versions" ]]; then
+            echo "No GLIBC symbol versions found in $LIBRARY." >&2
+            exit 1
+          fi
           maximum="$(printf '%s\n' "$versions" |
             sed 's/^GLIBC_//' | sort -Vu | tail -1)"
-          test "$(printf '%s\n' 2.27 "$maximum" | sort -V | tail -1)" = 2.27
+          printf 'Maximum GLIBC version: %s\n' "$maximum"
+          if [[ "$(printf '%s\n' 2.27 "$maximum" | sort -V | tail -1)" != 2.27 ]]; then
+            echo "Maximum GLIBC version $maximum exceeds 2.27." >&2
+            exit 1
+          fi
 
           exports="$(LC_ALL=C nm -D --defined-only "$LIBRARY" |
             awk '{print $3}' | sort)"
@@ -81,7 +93,11 @@ jobs:
             pty_resize \
             pty_spawn \
             pty_waitpid)"
-          test "$exports" = "$expected"
+          printf 'Exported symbols:\n%s\n' "$exports"
+          if [[ "$exports" != "$expected" ]]; then
+            echo "Native PTY shim exports do not match the expected ABI." >&2
+            exit 1
+          fi
 
           if LC_ALL=C readelf -d "$LIBRARY" | grep -Eq '(RPATH|RUNPATH)'; then
             echo "Native PTY shim must not contain RPATH or RUNPATH." >&2
@@ -213,17 +229,29 @@ jobs:
             extracted="$(mktemp)"
             unzip -p "$package" "$path" > "$extracted"
 
-            local header versions maximum exports expected
+            local header actual_class actual_machine versions maximum exports expected
             header="$(LC_ALL=C readelf -h "$extracted")"
-            grep -q 'Class:.*ELF64' <<<"$header"
-            grep -q "Machine:.*$expected_machine" <<<"$header"
+            actual_class="$(sed -n 's/^[[:space:]]*Class:[[:space:]]*//p' <<<"$header")"
+            actual_machine="$(sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p' <<<"$header")"
+            printf '%s: ELF class=%s, machine=%s\n' "$path" "$actual_class" "$actual_machine"
+            if [[ "$actual_class" != ELF64 || "$actual_machine" != "$expected_machine" ]]; then
+              echo "Unexpected packaged ELF header for $path." >&2
+              exit 1
+            fi
 
             versions="$(LC_ALL=C readelf --version-info "$extracted" |
               grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' || true)"
-            test -n "$versions"
+            if [[ -z "$versions" ]]; then
+              echo "No GLIBC symbol versions found in packaged asset $path." >&2
+              exit 1
+            fi
             maximum="$(printf '%s\n' "$versions" |
               sed 's/^GLIBC_//' | sort -Vu | tail -1)"
-            test "$(printf '%s\n' 2.27 "$maximum" | sort -V | tail -1)" = 2.27
+            printf '%s: maximum GLIBC version=%s\n' "$path" "$maximum"
+            if [[ "$(printf '%s\n' 2.27 "$maximum" | sort -V | tail -1)" != 2.27 ]]; then
+              echo "Packaged asset $path requires GLIBC $maximum, above 2.27." >&2
+              exit 1
+            fi
 
             exports="$(LC_ALL=C nm -D --defined-only "$extracted" |
               awk '{print $3}' | sort)"
@@ -233,7 +261,11 @@ jobs:
               pty_resize \
               pty_spawn \
               pty_waitpid)"
-            test "$exports" = "$expected"
+            printf '%s: exported symbols:\n%s\n' "$path" "$exports"
+            if [[ "$exports" != "$expected" ]]; then
+              echo "Packaged asset $path exports do not match the expected ABI." >&2
+              exit 1
+            fi
 
             if LC_ALL=C readelf -d "$extracted" | grep -Eq '(RPATH|RUNPATH)'; then
               echo "Packaged native PTY shim must not contain RPATH or RUNPATH." >&2
