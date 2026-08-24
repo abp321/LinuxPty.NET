@@ -25,4 +25,12 @@ target_compile_options(porta_pty PRIVATE
     $<$<CONFIG:Release>:-O2>
 )
 
-target_link_libraries(porta_pty PRIVATE util Threads::Threads)
+target_link_libraries(porta_pty PRIVATE
+    util
+    Threads::Threads
+    "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/porta_pty.map"
+)
+
+set_property(TARGET porta_pty APPEND PROPERTY
+    LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/porta_pty.map"
+)

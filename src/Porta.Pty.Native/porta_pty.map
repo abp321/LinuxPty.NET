@@ -1,0 +1,11 @@
+{
+    global:
+        pty_close;
+        pty_kill;
+        pty_resize;
+        pty_spawn;
+        pty_waitpid;
+
+    local:
+        *;
+};
