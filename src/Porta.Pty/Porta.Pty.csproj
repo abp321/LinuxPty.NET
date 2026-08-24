@@ -29,15 +29,18 @@
     <None Include="../../LICENSE" Pack="true" PackagePath="" />
     <None Include="$(_LinuxPtyNativeRoot)linux-x64/native/libporta_pty.so"
           Pack="true"
-          PackagePath="runtimes/linux-x64/native/" />
+          PackagePath="runtimes/linux-x64/native/"
+          Condition="'$(_LinuxPtyBuildRid)' != 'linux-x64'" />
     <None Include="$(_LinuxPtyNativeRoot)linux-arm64/native/libporta_pty.so"
           Pack="true"
-          PackagePath="runtimes/linux-arm64/native/" />
+          PackagePath="runtimes/linux-arm64/native/"
+          Condition="'$(_LinuxPtyBuildRid)' != 'linux-arm64'" />
   </ItemGroup>
 
   <ItemGroup Condition="Exists('$(_LinuxPtyBuildShim)')">
     <Content Include="$(_LinuxPtyBuildShim)"
-             Pack="false"
+             Pack="true"
+             PackagePath="runtimes/$(_LinuxPtyBuildRid)/native/"
              Link="libporta_pty.so"
              CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
