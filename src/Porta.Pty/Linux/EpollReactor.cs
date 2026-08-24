@@ -22,9 +22,8 @@ namespace Porta.Pty.Linux
         private const int MaxCommandsPerDrain = 16;
         private const int ENOENT = 2;
 
-        private static readonly Lazy<EpollReactor> SharedInstance = new(
-            static () => new EpollReactor(),
-            LazyThreadSafetyMode.ExecutionAndPublication);
+        private static readonly object SharedGate = new();
+        private static EpollReactor? shared;
 
         private readonly int epollFd;
         private readonly int wakeFd;
@@ -63,7 +62,16 @@ namespace Porta.Pty.Linux
             }
         }
 
-        internal static EpollReactor Shared => SharedInstance.Value;
+        internal static EpollReactor Shared
+        {
+            get
+            {
+                lock (SharedGate)
+                {
+                    return shared ??= new EpollReactor();
+                }
+            }
+        }
 
         internal void Register(PtyIoContext context)
         {
