@@ -1,119 +1,65 @@
-#!/bin/bash
-# Build script for porta_pty native library
-# Run this on each target platform to build the native library
+#!/usr/bin/env bash
 
-set -e
+set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="$SCRIPT_DIR/build"
-OUTPUT_DIR="$SCRIPT_DIR/output"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Detect platform
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    PLATFORM="osx"
-    LIB_EXT="dylib"
-    
-    # macOS can cross-compile for both architectures
-    for ARCH in "x86_64" "arm64"; do
-        if [[ "$ARCH" == "arm64" ]]; then
-            RID="osx-arm64"
-        else
-            RID="osx-x64"
-        fi
-        
-        echo "Building for $RID..."
-        
-        ARCH_BUILD_DIR="$BUILD_DIR/$RID"
-        rm -rf "$ARCH_BUILD_DIR"
-        mkdir -p "$ARCH_BUILD_DIR"
-        cd "$ARCH_BUILD_DIR"
-        
-        # Configure with architecture flag
-        cmake -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_OSX_ARCHITECTURES="$ARCH" \
-              "$SCRIPT_DIR"
-        cmake --build . --config Release
-        
-        # Copy to output directory
-        RUNTIME_DIR="$OUTPUT_DIR/runtimes/$RID/native"
-        mkdir -p "$RUNTIME_DIR"
-        cp "$ARCH_BUILD_DIR/bin/libporta_pty.$LIB_EXT" "$RUNTIME_DIR/"
-        
-        echo "Built: $RUNTIME_DIR/libporta_pty.$LIB_EXT"
-    done
-    
-elif [[ "$OSTYPE" == "linux"* ]]; then
-    PLATFORM="linux"
-    LIB_EXT="so"
-    
-    # Detect current architecture
-    CURRENT_ARCH=$(uname -m)
-    
-    # Build for current architecture
-    if [[ "$CURRENT_ARCH" == "aarch64" ]]; then
-        RID="linux-arm64"
-    else
-        RID="linux-x64"
-    fi
-    
-    echo "Building for $RID (native)..."
-    
-    ARCH_BUILD_DIR="$BUILD_DIR/$RID"
-    rm -rf "$ARCH_BUILD_DIR"
-    mkdir -p "$ARCH_BUILD_DIR"
-    cd "$ARCH_BUILD_DIR"
-    
-    cmake -DCMAKE_BUILD_TYPE=Release "$SCRIPT_DIR"
-    cmake --build . --config Release
-    
-    RUNTIME_DIR="$OUTPUT_DIR/runtimes/$RID/native"
-    mkdir -p "$RUNTIME_DIR"
-    cp "$ARCH_BUILD_DIR/bin/libporta_pty.$LIB_EXT" "$RUNTIME_DIR/"
-    
-    echo "Built: $RUNTIME_DIR/libporta_pty.$LIB_EXT"
-    
-    # Try cross-compile for other architecture if toolchain is available
-    if [[ "$CURRENT_ARCH" == "x86_64" ]]; then
-        CROSS_RID="linux-arm64"
-        CROSS_COMPILER="aarch64-linux-gnu-gcc"
-    else
-        CROSS_RID="linux-x64"
-        CROSS_COMPILER="x86_64-linux-gnu-gcc"
-    fi
-    
-    if command -v "$CROSS_COMPILER" &> /dev/null; then
-        echo "Cross-compiling for $CROSS_RID..."
-        
-        CROSS_BUILD_DIR="$BUILD_DIR/$CROSS_RID"
-        rm -rf "$CROSS_BUILD_DIR"
-        mkdir -p "$CROSS_BUILD_DIR"
-        cd "$CROSS_BUILD_DIR"
-        
-        # Create toolchain file
-        cat > toolchain.cmake << EOF
-set(CMAKE_SYSTEM_NAME Linux)
-set(CMAKE_C_COMPILER $CROSS_COMPILER)
-EOF
-        
-        cmake -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_TOOLCHAIN_FILE=toolchain.cmake \
-              "$SCRIPT_DIR"
-        cmake --build . --config Release
-        
-        RUNTIME_DIR="$OUTPUT_DIR/runtimes/$CROSS_RID/native"
-        mkdir -p "$RUNTIME_DIR"
-        cp "$CROSS_BUILD_DIR/bin/libporta_pty.$LIB_EXT" "$RUNTIME_DIR/"
-        
-        echo "Built: $RUNTIME_DIR/libporta_pty.$LIB_EXT"
-    else
-        echo "Cross-compiler $CROSS_COMPILER not found, skipping $CROSS_RID"
-    fi
-else
-    echo "Unsupported platform: $OSTYPE"
+if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "LinuxPty.NET's native shim can only be built on Linux." >&2
     exit 1
 fi
 
-echo ""
-echo "Build complete!"
-echo "Output directory: $OUTPUT_DIR/runtimes/"
-ls -la "$OUTPUT_DIR/runtimes/"*/native/ 2>/dev/null || true
+if ! getconf GNU_LIBC_VERSION 2>/dev/null | grep -q '^glibc '; then
+    echo "LinuxPty.NET produces glibc Linux assets; musl is not supported." >&2
+    exit 1
+fi
+
+case "$(uname -m)" in
+    x86_64)
+        rid="linux-x64"
+        expected_machine="Advanced Micro Devices X86-64"
+        ;;
+    aarch64|arm64)
+        rid="linux-arm64"
+        expected_machine="AArch64"
+        ;;
+    *)
+        echo "Unsupported Linux architecture: $(uname -m)" >&2
+        exit 1
+        ;;
+esac
+
+expected_rid="${1:-}"
+if [[ -n "$expected_rid" && "$expected_rid" != "$rid" ]]; then
+    echo "This runner is $rid, not the requested $expected_rid." >&2
+    exit 1
+fi
+
+build_dir="$script_dir/build/$rid"
+output_dir="$script_dir/output/runtimes/$rid/native"
+library="$build_dir/bin/libporta_pty.so"
+
+rm -rf "$build_dir"
+mkdir -p "$build_dir"
+(
+    cd "$build_dir"
+    cmake -DCMAKE_BUILD_TYPE=Release "$script_dir"
+    cmake --build . --config Release
+)
+
+if [[ ! -f "$library" ]]; then
+    echo "Native build did not produce $library." >&2
+    exit 1
+fi
+
+elf_class="$(readelf -h "$library" | awk -F: '/Class:/{sub(/^[[:space:]]+/, "", $2); print $2}')"
+machine="$(readelf -h "$library" | awk -F: '/Machine:/{sub(/^[[:space:]]+/, "", $2); print $2}')"
+if [[ "$elf_class" != "ELF64" || "$machine" != "$expected_machine" ]]; then
+    echo "Unexpected native asset: class='$elf_class', machine='$machine'." >&2
+    exit 1
+fi
+
+mkdir -p "$output_dir"
+cp "$library" "$output_dir/libporta_pty.so"
+
+echo "Built $output_dir/libporta_pty.so"

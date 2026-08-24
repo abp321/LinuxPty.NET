@@ -1,36 +1,29 @@
-﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 namespace Porta.Pty.Linux
 {
     using System;
     using System.Collections.Generic;
-    using System.Diagnostics;
     using System.Linq;
-    using System.Runtime.InteropServices;
-    using System.Threading;
-    using System.Threading.Tasks;
     using static Porta.Pty.Linux.NativeMethods;
 
     /// <summary>
-    /// Provides a pty connection for linux machines.
+    /// Provides PTY connections on Linux.
     /// </summary>
-    internal class PtyProvider : Unix.PtyProvider
+    internal static class PtyProvider
     {
-        /// <inheritdoc/>
-        public override Task<IPtyConnection> StartTerminalAsync(PtyOptions options, TraceSource trace, CancellationToken cancellationToken)
+        public static IPtyConnection StartTerminal(PtyOptions options)
         {
-            var winSize = new PtyWinSize((ushort)options.Rows, (ushort)options.Cols);
-
+            var terminalSize = new PtyWinSize((ushort)options.Rows, (ushort)options.Cols);
             string?[] terminalArgs = GetExecvpArgs(options);
 
-            // Convert environment dictionary to "KEY=VALUE" string array for native code
-            string?[]? envp = null;
-            if (options.Environment != null && options.Environment.Count > 0)
+            string?[]? environment = null;
+            if (options.Environment.Count > 0)
             {
-                envp = options.Environment
-                    .Select(kvp => $"{kvp.Key}={kvp.Value}")
-                    .Concat(new string?[] { null }) // NULL-terminated
+                environment = options.Environment
+                    .Select(pair => $"{pair.Key}={pair.Value}")
+                    .Concat(new string?[] { null })
                     .ToArray();
             }
 
@@ -54,23 +47,24 @@ namespace Porta.Pty.Linux
                 { TermSpecialControlCharacter.VTIME, 0 },
             };
 
-            var term = new PtyTermios(
-                inputFlag: TermInputFlag.ICRNL | TermInputFlag.IXON | TermInputFlag.IXANY | TermInputFlag.IMAXBEL | TermInputFlag.BRKINT | TermInputFlag.IUTF8,
-                outputFlag: TermOutputFlag.NONE,  // Disable all output processing for raw terminal emulation
+            var termios = new PtyTermios(
+                inputFlag: TermInputFlag.ICRNL | TermInputFlag.IXON | TermInputFlag.IXANY
+                    | TermInputFlag.IMAXBEL | TermInputFlag.BRKINT | TermInputFlag.IUTF8,
+                outputFlag: TermOutputFlag.NONE,
                 controlFlag: TermControlFlag.CREAD | TermControlFlag.CS8 | TermControlFlag.HUPCL,
-                localFlag: TermLocalFlag.ICANON | TermLocalFlag.ISIG | TermLocalFlag.IEXTEN | TermLocalFlag.ECHO | TermLocalFlag.ECHOE | TermLocalFlag.ECHOK | TermLocalFlag.ECHOKE | TermLocalFlag.ECHOCTL,
+                localFlag: TermLocalFlag.ICANON | TermLocalFlag.ISIG | TermLocalFlag.IEXTEN
+                    | TermLocalFlag.ECHO | TermLocalFlag.ECHOE | TermLocalFlag.ECHOK
+                    | TermLocalFlag.ECHOKE | TermLocalFlag.ECHOCTL,
                 speed: TermSpeed.B38400,
                 controlCharacters: controlCharacters);
-    
-            // Use native shim to spawn process - this avoids W^X issues
-            // by performing fork+exec entirely in native code
-            var result = pty_spawn(
+
+            PtySpawnResult result = pty_spawn(
                 options.App,
                 terminalArgs,
-                envp,
+                environment,
                 options.Cwd,
-                ref term,
-                ref winSize);
+                ref termios,
+                ref terminalSize);
 
             if (result.Pid == -1)
             {
@@ -78,18 +72,23 @@ namespace Porta.Pty.Linux
                     $"pty_spawn failed for '{options.App}': error={result.Error} "
                     + $"({GetErrorMessage(result.Error)}), masterFd={result.MasterFd}, pid={result.Pid}");
             }
-            
-            return Task.FromResult<IPtyConnection>(new PtyConnection(result.MasterFd, result.Pid));
+
+            return new PtyConnection(result.MasterFd, result.Pid);
         }
 
-        /// <remarks>
-        /// The curated switch covered four values and rendered everything else as the bare number, so
-        /// the interesting failures were exactly the ones it could not name. Win32Exception maps an
-        /// errno through strerror on Unix, which names all of them. A NON-POSITIVE value is reported as
-        /// such rather than translated: errno is never zero or negative, so seeing one means the result
-        /// struct did not carry what it was expected to, and that is a different problem than whatever
-        /// errno would have described.
-        /// </remarks>
+        private static string?[] GetExecvpArgs(PtyOptions options)
+        {
+            if (options.CommandLine.Length == 0)
+            {
+                return new[] { options.App, null };
+            }
+
+            var result = new string?[options.CommandLine.Length + 2];
+            Array.Copy(options.CommandLine, 0, result, 1, options.CommandLine.Length);
+            result[0] = options.App;
+            return result;
+        }
+
         private static string GetErrorMessage(int errno)
         {
             if (errno <= 0)

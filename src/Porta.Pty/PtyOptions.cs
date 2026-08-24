@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 namespace Porta.Pty
@@ -7,15 +7,10 @@ namespace Porta.Pty
     using System.Collections.Generic;
 
     /// <summary>
-    /// Options for spawning a new pty process.
+    /// Options for spawning a new PTY process.
     /// </summary>
     public class PtyOptions
     {
-        /// <summary>
-        /// Gets or sets the terminal name.
-        /// </summary>
-        public string? Name { get; set; }
-
         /// <summary>
         /// Gets or sets the number of initial rows.
         /// </summary>
@@ -37,19 +32,12 @@ namespace Porta.Pty
         public string App { get; set; } = string.Empty;
 
         /// <summary>
-        /// Gets or sets the command line arguments to the process.
+        /// Gets or sets the command-line arguments for the process.
         /// </summary>
         public string[] CommandLine { get; set; } = Array.Empty<string>();
 
         /// <summary>
-        /// Gets or sets a value indicating whether command line arguments must be quoted.
-        /// <c>false</c>, the default, means that the arguments must be quoted and quotes inside escaped then concatenated with spaces.
-        /// <c>true</c> means that the arguments must not be quoted and just concatenated with spaces.
-        /// </summary>
-        public bool VerbatimCommandLine { get; set; }
-
-        /// <summary>
-        /// Gets or sets the process' environment variables.
+        /// Gets or sets the process environment variables.
         /// </summary>
         public IDictionary<string, string> Environment { get; set; } = new Dictionary<string, string>();
     }

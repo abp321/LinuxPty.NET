@@ -1,99 +1,51 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
-
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-  </PropertyGroup>
-  <PropertyGroup>
+    <RootNamespace>Porta.Pty</RootNamespace>
     <PackageId>LinuxPty.NET</PackageId>
     <Title>LinuxPty.NET</Title>
-    <Description>Linux-focused pseudoterminal (PTY) library for .NET, derived from Porta.Pty and intended for modern Linux-specific optimization.</Description>
+    <Description>Linux-only pseudoterminal library for .NET 10, derived from Porta.Pty.</Description>
     <Authors>abp321;Tom Laird-McConnell</Authors>
+    <Copyright>Copyright (c) 2025 Tom Laird-McConnell; modifications copyright (c) 2026 abp321</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/abp321/LinuxPty.NET</PackageProjectUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <PackageTags>pty;linux;terminal;pseudoterminal;dotnet</PackageTags>
     <RepositoryUrl>https://github.com/abp321/LinuxPty.NET</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <Copyright>Copyright (c) 2025 Tom Laird-McConnell; modifications copyright (c) 2026 abp321</Copyright>
     <Version>0.1.0</Version>
-    <AssemblyVersion>0.1.0.0</AssemblyVersion>
-    <RootNamespace>Porta.Pty</RootNamespace>
-    <PackageTags>pty;linux;terminal;pseudoterminal;dotnet</PackageTags>
-    <ContentTargetFolders>content</ContentTargetFolders>
-    <IncludeSymbols>true</IncludeSymbols>
-    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
 
   <PropertyGroup>
-    <ConptyRequiresx64Host>true</ConptyRequiresx64Host>
-    <ConptyRequiresARM64Host>true</ConptyRequiresARM64Host>
+    <_LinuxPtyNativeRoot>$(MSBuildThisFileDirectory)../Porta.Pty.Native/output/runtimes/</_LinuxPtyNativeRoot>
+    <_LinuxPtyBuildRid Condition="'$(RuntimeIdentifier)' != ''">$(RuntimeIdentifier)</_LinuxPtyBuildRid>
+    <_LinuxPtyBuildRid Condition="'$(_LinuxPtyBuildRid)' == ''">$(NETCoreSdkRuntimeIdentifier)</_LinuxPtyBuildRid>
+    <_LinuxPtyBuildShim>$(_LinuxPtyNativeRoot)$(_LinuxPtyBuildRid)/native/libporta_pty.so</_LinuxPtyBuildShim>
   </PropertyGroup>
-
-  <ItemGroup>
-    <InternalsVisibleTo Include="Porta.Pty.Tests" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <PackageReference Include="Microsoft.Windows.Console.ConPTY" Version="1.24.260710001" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <None Include="build/Porta.Pty.targets" Pack="true" PackagePath="buildTransitive/$(PackageId).targets" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <None Remove="NativeMethods.txt" />
-    <AdditionalFiles Include="NativeMethods.txt" />
-  </ItemGroup>
 
   <ItemGroup>
     <None Include="../../README.md" Pack="true" PackagePath="" />
     <None Include="../../LICENSE" Pack="true" PackagePath="" />
+    <None Include="$(_LinuxPtyNativeRoot)linux-x64/native/libporta_pty.so"
+          Pack="true"
+          PackagePath="runtimes/linux-x64/native/" />
+    <None Include="$(_LinuxPtyNativeRoot)linux-arm64/native/libporta_pty.so"
+          Pack="true"
+          PackagePath="runtimes/linux-arm64/native/" />
   </ItemGroup>
 
-  <PropertyGroup>
-    <_PortaPtyNativeRoot>$(MSBuildThisFileDirectory)../Porta.Pty.Native/output/runtimes/</_PortaPtyNativeRoot>
-    <_PortaPtyShimRid Condition="'$(RuntimeIdentifier)' != ''">$(RuntimeIdentifier)</_PortaPtyShimRid>
-    <_PortaPtyShimRid Condition="'$(_PortaPtyShimRid)' == ''">$(NETCoreSdkRuntimeIdentifier)</_PortaPtyShimRid>
-    <_PortaPtyShimName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libporta_pty.dylib</_PortaPtyShimName>
-    <_PortaPtyShimName Condition="$([MSBuild]::IsOSPlatform('Linux'))">libporta_pty.so</_PortaPtyShimName>
-    <_PortaPtyShimPath>$(_PortaPtyNativeRoot)$(_PortaPtyShimRid)/native/$(_PortaPtyShimName)</_PortaPtyShimPath>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <None Include="$(_PortaPtyNativeRoot)linux-x64/native/libporta_pty.so"
-          Pack="true"
-          PackagePath="runtimes/linux-x64/native/"
-          Condition="'$(_PortaPtyShimRid)' != 'linux-x64' And Exists('$(_PortaPtyNativeRoot)linux-x64/native/libporta_pty.so')" />
-    <None Include="$(_PortaPtyNativeRoot)linux-arm64/native/libporta_pty.so"
-          Pack="true"
-          PackagePath="runtimes/linux-arm64/native/"
-          Condition="'$(_PortaPtyShimRid)' != 'linux-arm64' And Exists('$(_PortaPtyNativeRoot)linux-arm64/native/libporta_pty.so')" />
-    <None Include="$(_PortaPtyNativeRoot)osx-x64/native/libporta_pty.dylib"
-          Pack="true"
-          PackagePath="runtimes/osx-x64/native/"
-          Condition="'$(_PortaPtyShimRid)' != 'osx-x64' And Exists('$(_PortaPtyNativeRoot)osx-x64/native/libporta_pty.dylib')" />
-    <None Include="$(_PortaPtyNativeRoot)osx-arm64/native/libporta_pty.dylib"
-          Pack="true"
-          PackagePath="runtimes/osx-arm64/native/"
-          Condition="'$(_PortaPtyShimRid)' != 'osx-arm64' And Exists('$(_PortaPtyNativeRoot)osx-arm64/native/libporta_pty.dylib')" />
-  </ItemGroup>
-
-  <ItemGroup Condition="'$(_PortaPtyShimName)' != '' And Exists('$(_PortaPtyShimPath)')">
-    <Content Include="$(_PortaPtyShimPath)"
-             Pack="true"
-             PackagePath="runtimes/$(_PortaPtyShimRid)/native/"
-             Link="$(_PortaPtyShimName)"
+  <ItemGroup Condition="Exists('$(_LinuxPtyBuildShim)')">
+    <Content Include="$(_LinuxPtyBuildShim)"
+             Pack="false"
+             Link="libporta_pty.so"
              CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Microsoft.Windows.CsWin32" Version="0.3.183">
-      <PrivateAssets>all</PrivateAssets>
-      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
-    </PackageReference>
-
-  </ItemGroup>
+  <Target Name="ValidateLinuxPtyNativeAssets" BeforeTargets="Pack">
+    <Error Condition="!Exists('$(_LinuxPtyNativeRoot)linux-x64/native/libporta_pty.so')"
+           Text="The linux-x64 native PTY shim must be built before packing." />
+    <Error Condition="!Exists('$(_LinuxPtyNativeRoot)linux-arm64/native/libporta_pty.so')"
+           Text="The linux-arm64 native PTY shim must be built before packing." />
+  </Target>
 </Project>

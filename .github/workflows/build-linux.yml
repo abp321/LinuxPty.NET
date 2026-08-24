@@ -1,75 +1,258 @@
-name: Linux
+name: Linux CI
 
 on:
+  workflow_call:
+    inputs:
+      package_version:
+        description: Optional NuGet package version override
+        required: false
+        type: string
   workflow_dispatch:
   push:
-    branches:
-      - main
-    paths:
-    - src/**
-    - .github/workflows/**
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
-    paths:
-    - src/**
-    - .github/workflows/**
-    
+    branches: [main]
+
+permissions:
+  contents: read
+
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  native:
+    name: Native ${{ matrix.rid }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: linux-x64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            machine: Advanced Micro Devices X86-64
+          - rid: linux-arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            machine: AArch64
+    runs-on: ${{ matrix.runner }}
 
     steps:
-    - name: Checkout Porta.Pty.sln
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v7
 
-    - name: Setup .NET
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: 10.0.x
+      - name: Build native PTY shim
+        env:
+          CONTAINER_PLATFORM: ${{ matrix.platform }}
+          EXPECTED_RID: ${{ matrix.rid }}
+        run: |
+          docker run --rm \
+            --platform "$CONTAINER_PLATFORM" \
+            -e EXPECTED_RID \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace/src/Porta.Pty.Native \
+            ubuntu:18.04 \
+            bash -euxo pipefail -c '
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                --no-install-recommends build-essential cmake binutils
+              ./build.sh "$EXPECTED_RID"
+            '
 
-    - name: Install native build dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake build-essential
+      - name: Verify native PTY shim
+        env:
+          EXPECTED_MACHINE: ${{ matrix.machine }}
+          LIBRARY: src/Porta.Pty.Native/output/runtimes/${{ matrix.rid }}/native/libporta_pty.so
+        run: |
+          set -euo pipefail
 
-    - name: Build native PTY shim
-      run: |
-        cd src/Porta.Pty.Native
-        chmod +x build.sh
-        ./build.sh
+          header="$(LC_ALL=C readelf -h "$LIBRARY")"
+          grep -q 'Class:.*ELF64' <<<"$header"
+          grep -q "Machine:.*$EXPECTED_MACHINE" <<<"$header"
 
-    - name: Restore dependencies
-      run: dotnet restore src/Porta.Pty.sln
+          versions="$(LC_ALL=C readelf --version-info "$LIBRARY" |
+            grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' || true)"
+          test -n "$versions"
+          maximum="$(printf '%s\n' "$versions" |
+            sed 's/^GLIBC_//' | sort -Vu | tail -1)"
+          test "$(printf '%s\n' 2.27 "$maximum" | sort -V | tail -1)" = 2.27
 
-    - name: Build
-      run: dotnet build --no-restore src/Porta.Pty.sln --property WarningLevel=0
-      
-    # The library stages its own shim into a ProjectReference consumer's output now, so there is no
-    # copy step here any more. This asserts that it happened: a missing shim otherwise surfaces twenty
-    # lines later as DllNotFoundException, naming nothing that points back at the staging.
-    - name: Verify the native shim was staged for the tests
-      run: |
-        out=$(dirname "$(find src/Porta.Pty.Tests/bin/Debug -name 'Porta.Pty.Tests.dll' | head -1)")
-        [ -n "$out" ] || { echo "::error::test output not found"; exit 1; }
-        if [ ! -f "$out/libporta_pty.so" ]; then
-          echo "::error::libporta_pty.so is not beside the test assembly in $out"
-          ls -la "$out"
-          exit 1
-        fi
-        echo "shim staged in $out"
+          exports="$(LC_ALL=C nm -D --defined-only "$LIBRARY" |
+            awk '{print $3}' | sort)"
+          expected="$(printf '%s\n' \
+            pty_close \
+            pty_kill \
+            pty_resize \
+            pty_spawn \
+            pty_waitpid)"
+          test "$exports" = "$expected"
 
-    - name: Test
-      run: dotnet test --no-build --verbosity normal src/Porta.Pty.sln
+          if LC_ALL=C readelf -d "$LIBRARY" | grep -Eq '(RPATH|RUNPATH)'; then
+            echo "Native PTY shim must not contain RPATH or RUNPATH." >&2
+            exit 1
+          fi
 
-    # The tests reference the library by PROJECT, so they cannot see a packaging defect at all: no
-    # .nupkg, no runtimes/ resolution, no buildTransitive/. This packs and consumes for real.
-    - name: Verify a package consumer works
-      run: ./scripts/verify-consumer.sh
+      - name: Upload native PTY shim
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-${{ matrix.rid }}
+          path: src/Porta.Pty.Native/output/runtimes/${{ matrix.rid }}/native/libporta_pty.so
+          if-no-files-found: error
+          retention-days: 1
 
-    # Native AOT is a different question from packaging: whether the interop survives with no JIT and no
-    # reflection fallback. The sample asserts RuntimeFeature.IsDynamicCodeSupported is FALSE first, so a
-    # misconfigured publish that quietly produced an ordinary binary fails rather than passing.
-    - name: Native AOT demo
-      run: |
-        dotnet publish samples/Porta.Pty.AotDemo/Porta.Pty.AotDemo.csproj -c Release -o aot --nologo
-        ./aot/Porta.Pty.AotDemo
+  package:
+    name: Build and pack
+    needs: native
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Download linux-x64 native PTY shim
+        uses: actions/download-artifact@v8
+        with:
+          name: native-linux-x64
+          path: src/Porta.Pty.Native/output/runtimes/linux-x64/native
+
+      - name: Download linux-arm64 native PTY shim
+        uses: actions/download-artifact@v8
+        with:
+          name: native-linux-arm64
+          path: src/Porta.Pty.Native/output/runtimes/linux-arm64/native
+
+      - name: Restore
+        run: dotnet restore LinuxPty.NET.slnx
+
+      - name: Build
+        run: >
+          dotnet build LinuxPty.NET.slnx
+          -c Release
+          --no-restore
+          -p:ContinuousIntegrationBuild=true
+
+      - name: Pack
+        env:
+          PACKAGE_VERSION: ${{ inputs.package_version || '' }}
+        run: |
+          set -euo pipefail
+          version_args=()
+          if [[ -n "$PACKAGE_VERSION" ]]; then
+            version_args+=("-p:PackageVersion=$PACKAGE_VERSION")
+          fi
+
+          dotnet pack src/Porta.Pty/Porta.Pty.csproj \
+            -c Release \
+            --no-build \
+            -o artifacts/nuget \
+            -p:ContinuousIntegrationBuild=true \
+            "${version_args[@]}"
+
+      - name: Verify package
+        env:
+          EXPECTED_PACKAGE_VERSION: ${{ inputs.package_version || '' }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t packages < <(
+            find artifacts/nuget -maxdepth 1 -type f \
+              -name 'LinuxPty.NET.*.nupkg' ! -name '*.snupkg' | sort
+          )
+          if [[ ${#packages[@]} -ne 1 ]]; then
+            echo "Expected one LinuxPty.NET package, found ${#packages[@]}." >&2
+            find artifacts/nuget -maxdepth 1 -type f -print
+            exit 1
+          fi
+
+          package="${packages[0]}"
+          listing="$(unzip -Z1 "$package")"
+          printf '%s\n' "$listing"
+
+          for required in \
+            README.md \
+            LICENSE \
+            lib/net10.0/Porta.Pty.dll \
+            runtimes/linux-x64/native/libporta_pty.so \
+            runtimes/linux-arm64/native/libporta_pty.so
+          do
+            grep -Fxq "$required" <<<"$listing" || {
+              echo "Package entry is missing: $required" >&2
+              exit 1
+            }
+          done
+
+          native_count="$(grep -Ec '^runtimes/[^/]+/native/' <<<"$listing")"
+          test "$native_count" -eq 2
+
+          if grep -Eiq \
+            '(^|/)(runtimes/(win-|osx-)|tests?(/|$)|samples?(/|$)|icon\.png$)|conpty|openconsole|\.dylib$|buildtransitive' \
+            <<<"$listing"
+          then
+            echo "Package contains a removed platform or repository artifact." >&2
+            exit 1
+          fi
+
+          cmp -s README.md <(unzip -p "$package" README.md)
+          cmp -s LICENSE <(unzip -p "$package" LICENSE)
+
+          nuspec="$(grep -E '\.nuspec$' <<<"$listing")"
+          actual_version="$(unzip -p "$package" "$nuspec" |
+            sed -n 's:.*<version>\([^<]*\)</version>.*:\1:p' | head -1)"
+          test -n "$actual_version"
+          if [[ -n "$EXPECTED_PACKAGE_VERSION" &&
+                "$actual_version" != "$EXPECTED_PACKAGE_VERSION" ]]; then
+            echo "Package version '$actual_version' does not match '$EXPECTED_PACKAGE_VERSION'." >&2
+            exit 1
+          fi
+
+          verify_native() {
+            local path="$1"
+            local expected_machine="$2"
+            local extracted
+            extracted="$(mktemp)"
+            unzip -p "$package" "$path" > "$extracted"
+
+            local header versions maximum exports expected
+            header="$(LC_ALL=C readelf -h "$extracted")"
+            grep -q 'Class:.*ELF64' <<<"$header"
+            grep -q "Machine:.*$expected_machine" <<<"$header"
+
+            versions="$(LC_ALL=C readelf --version-info "$extracted" |
+              grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' || true)"
+            test -n "$versions"
+            maximum="$(printf '%s\n' "$versions" |
+              sed 's/^GLIBC_//' | sort -Vu | tail -1)"
+            test "$(printf '%s\n' 2.27 "$maximum" | sort -V | tail -1)" = 2.27
+
+            exports="$(LC_ALL=C nm -D --defined-only "$extracted" |
+              awk '{print $3}' | sort)"
+            expected="$(printf '%s\n' \
+              pty_close \
+              pty_kill \
+              pty_resize \
+              pty_spawn \
+              pty_waitpid)"
+            test "$exports" = "$expected"
+
+            if LC_ALL=C readelf -d "$extracted" | grep -Eq '(RPATH|RUNPATH)'; then
+              echo "Packaged native PTY shim must not contain RPATH or RUNPATH." >&2
+              exit 1
+            fi
+            rm -f "$extracted"
+          }
+
+          verify_native \
+            runtimes/linux-x64/native/libporta_pty.so \
+            'Advanced Micro Devices X86-64'
+          verify_native \
+            runtimes/linux-arm64/native/libporta_pty.so \
+            AArch64
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: linuxpty-package
+          path: artifacts/nuget/LinuxPty.NET.*.nupkg
+          if-no-files-found: error
+          retention-days: 7

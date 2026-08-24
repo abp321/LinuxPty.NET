@@ -1,0 +1,85 @@
+name: Publish LinuxPty.NET
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: NuGet package version, for example 0.1.0-preview.2
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate branch and version
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Packages can only be published from main." >&2
+            exit 1
+          fi
+
+          if [[ ! "$PACKAGE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "Invalid NuGet package version: $PACKAGE_VERSION" >&2
+            exit 1
+          fi
+
+  build:
+    needs: validate
+    uses: ./.github/workflows/build-linux.yml
+    with:
+      package_version: ${{ inputs.version }}
+    permissions:
+      contents: read
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Download verified package
+        uses: actions/download-artifact@v8
+        with:
+          name: linuxpty-package
+          path: artifacts/nuget
+
+      - name: Publish to GitHub Packages
+        env:
+          NUGET_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t packages < <(
+            find artifacts/nuget -maxdepth 1 -type f \
+              -name 'LinuxPty.NET.*.nupkg' ! -name '*.snupkg' | sort
+          )
+          if [[ ${#packages[@]} -ne 1 ]]; then
+            echo "Expected one verified package, found ${#packages[@]}." >&2
+            exit 1
+          fi
+
+          dotnet nuget add source \
+            --username "$GITHUB_ACTOR" \
+            --password "$NUGET_AUTH_TOKEN" \
+            --store-password-in-clear-text \
+            --name github-abp321 \
+            https://nuget.pkg.github.com/abp321/index.json
+
+          dotnet nuget push "${packages[0]}" \
+            --source github-abp321 \
+            --api-key "$NUGET_AUTH_TOKEN"
+
