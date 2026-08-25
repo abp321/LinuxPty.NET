@@ -57,20 +57,6 @@ namespace Porta.Pty.Linux
 
         internal int ExitCode => Volatile.Read(ref this.exitCode);
 
-        internal bool HasReapingOwner
-        {
-            get
-            {
-                lock (this.reapGate)
-                {
-                    return this.lifetimeState is LifetimeState.Epoll
-                        or LifetimeState.Fallback
-                        or LifetimeState.Reaping
-                        or LifetimeState.Completed;
-                }
-            }
-        }
-
         internal int SendSignal(int signal)
         {
             lock (this.reapGate)

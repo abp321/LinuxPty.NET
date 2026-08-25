@@ -94,7 +94,6 @@ namespace Porta.Pty.Linux
 
             PtyProcessState? processState = null;
             PtyIoContext? ioContext = null;
-            bool masterClosed = false;
             try
             {
                 int configureError = pty_configure_master(result.MasterFd);
@@ -119,32 +118,13 @@ namespace Porta.Pty.Linux
                 if (processState is null)
                 {
                     CleanupUntrackedChild(result.MasterFd, result.Pid);
-                    masterClosed = true;
                 }
                 else
                 {
-                    _ = processState.SendSignal(SIGKILL);
-                    if (ioContext is not null)
-                    {
-                        await ioContext.StopAsync().ConfigureAwait(false);
-                    }
-
-                    _ = pty_close(result.MasterFd);
-                    masterClosed = true;
-                    try
-                    {
-                        processState.ReapSynchronouslyAfterTrackingFailure();
-                        await processState.ExitTask.ConfigureAwait(false);
-                    }
-                    catch
-                    {
-                        // Cleanup must not replace the setup exception.
-                    }
-                }
-
-                if (!masterClosed)
-                {
-                    _ = pty_close(result.MasterFd);
+                    await CleanupTrackedChildAsync(
+                        result.MasterFd,
+                        processState,
+                        ioContext).ConfigureAwait(false);
                 }
 
                 if (cancellationToken.IsCancellationRequested)
@@ -182,12 +162,49 @@ namespace Porta.Pty.Linux
         private static void CleanupUntrackedChild(int masterFd, int pid)
         {
             TryKill(pid, SIGKILL);
-            _ = pty_close(masterFd);
+            TryClose(masterFd);
 
-            int status = 0;
-            while (pty_waitpid(pid, ref status, 0) == -1
-                && Marshal.GetLastWin32Error() == EINTR)
+            try
             {
+                int status = 0;
+                while (pty_waitpid(pid, ref status, 0) == -1
+                    && Marshal.GetLastWin32Error() == EINTR)
+                {
+                }
+            }
+            catch
+            {
+                // Cleanup must not replace the setup exception or cancellation.
+            }
+        }
+
+        private static async Task CleanupTrackedChildAsync(
+            int masterFd,
+            PtyProcessState processState,
+            PtyIoContext? ioContext)
+        {
+            TrySendSignal(processState, SIGKILL);
+            if (ioContext is not null)
+            {
+                try
+                {
+                    await ioContext.StopAsync().ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Continue closing and reaping the child.
+                }
+            }
+
+            TryClose(masterFd);
+            try
+            {
+                processState.ReapSynchronouslyAfterTrackingFailure();
+                await processState.ExitTask.ConfigureAwait(false);
+            }
+            catch
+            {
+                // Cleanup must not replace the setup exception or cancellation.
             }
         }
 
@@ -200,6 +217,31 @@ namespace Porta.Pty.Linux
             catch
             {
                 // Continue closing and reaping the child.
+            }
+        }
+
+        private static void TrySendSignal(PtyProcessState processState, int signal)
+        {
+            try
+            {
+                _ = processState.SendSignal(signal);
+            }
+            catch
+            {
+                // Continue closing and reaping the child.
+            }
+        }
+
+        private static void TryClose(int fileDescriptor)
+        {
+            try
+            {
+                // Never retry close after EINTR because Linux may already have reused the fd.
+                _ = pty_close(fileDescriptor);
+            }
+            catch
+            {
+                // Continue reaping the child.
             }
         }
     }

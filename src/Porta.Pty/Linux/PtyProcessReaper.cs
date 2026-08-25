@@ -74,13 +74,12 @@ namespace Porta.Pty.Linux
 
         private void Run()
         {
+            var snapshot = new List<PtyProcessState>();
             for (;;)
             {
-                PtyProcessState[] snapshot;
                 lock (this.gate)
                 {
-                    snapshot = new PtyProcessState[this.processes.Count];
-                    this.processes.CopyTo(snapshot);
+                    snapshot.AddRange(this.processes);
                 }
 
                 foreach (PtyProcessState process in snapshot)
@@ -98,8 +97,10 @@ namespace Porta.Pty.Linux
                     process.FinishReapingFromFallback(exitCode, failure);
                 }
 
+                bool hasProcesses = snapshot.Count != 0;
+                snapshot.Clear();
                 this.wakeEvent.WaitOne(
-                    snapshot.Length == 0 ? Timeout.Infinite : PollIntervalMilliseconds);
+                    hasProcesses ? PollIntervalMilliseconds : Timeout.Infinite);
             }
         }
     }
