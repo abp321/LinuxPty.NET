@@ -4,7 +4,6 @@
 namespace Porta.Pty
 {
     using System;
-    using System.Collections;
     using System.Collections.Generic;
     using System.Threading;
     using System.Threading.Tasks;
@@ -14,20 +13,6 @@ namespace Porta.Pty
     /// </summary>
     public static class PtyProvider
     {
-        private static readonly IDictionary<string, string> LinuxPtyEnvironment =
-            new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                { "TERM", "xterm-256color" },
-                { "TMUX", string.Empty },
-                { "TMUX_PANE", string.Empty },
-                { "STY", string.Empty },
-                { "WINDOW", string.Empty },
-                { "WINDOWID", string.Empty },
-                { "TERMCAP", string.Empty },
-                { "COLUMNS", string.Empty },
-                { "LINES", string.Empty },
-            };
-
         /// <summary>
         /// Spawns a new process connected to a Linux pseudoterminal.
         /// </summary>
@@ -72,45 +57,12 @@ namespace Porta.Pty
                 Rows = options.Rows,
                 Cols = options.Cols,
                 CommandLine = (string[])options.CommandLine.Clone(),
-                Environment = MergeEnvironment(
+                Environment = new Dictionary<string, string>(
                     options.Environment,
-                    MergeEnvironment(LinuxPtyEnvironment, null)),
+                    StringComparer.Ordinal),
             };
 
             return Linux.PtySpawnQueue.Shared.Enqueue(preparedOptions, cancellationToken);
-        }
-
-        private static IDictionary<string, string> MergeEnvironment(
-            IDictionary<string, string> environmentToMerge,
-            IDictionary<string, string>? environment)
-        {
-            if (environment == null)
-            {
-                environment = new Dictionary<string, string>(StringComparer.Ordinal);
-                foreach (DictionaryEntry entry in Environment.GetEnvironmentVariables())
-                {
-                    if (entry.Key.ToString() is not { } key)
-                    {
-                        continue;
-                    }
-
-                    environment[key] = entry.Value?.ToString() ?? string.Empty;
-                }
-            }
-
-            foreach (var pair in environmentToMerge)
-            {
-                if (string.IsNullOrEmpty(pair.Value))
-                {
-                    environment.Remove(pair.Key);
-                }
-                else
-                {
-                    environment[pair.Key] = pair.Value;
-                }
-            }
-
-            return environment;
         }
     }
 }

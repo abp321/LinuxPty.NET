@@ -1,11 +1,10 @@
 {
     global:
         pty_close;
-        pty_configure_master;
+        pty_cleanup_untracked;
         pty_io_read;
         pty_io_write;
         pty_kill;
-        pty_pidfd_open;
         pty_pidfd_send_signal;
         pty_reactor_control;
         pty_reactor_create;
@@ -14,7 +13,7 @@
         pty_reactor_wake;
         pty_resize;
         pty_spawn;
-        pty_waitpid;
+        pty_wait_child;
 
     local:
         *;

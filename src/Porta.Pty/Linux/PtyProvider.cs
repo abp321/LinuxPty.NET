@@ -4,9 +4,7 @@
 namespace Porta.Pty.Linux
 {
     using System;
-    using System.Collections.Generic;
     using System.Linq;
-    using System.Runtime.InteropServices;
     using System.Threading;
     using System.Threading.Tasks;
     using static Porta.Pty.Linux.NativeMethods;
@@ -16,63 +14,29 @@ namespace Porta.Pty.Linux
     /// </summary>
     internal static class PtyProvider
     {
-        private const int EINTR = 4;
-
         internal static async Task<IPtyConnection> StartTerminalAsync(
             PtyOptions options,
             CancellationToken cancellationToken)
         {
-            var terminalSize = new PtyWinSize((ushort)options.Rows, (ushort)options.Cols);
             string?[] terminalArgs = GetExecvpArgs(options);
 
-            string?[]? environment = null;
+            string?[]? environmentMutations = null;
             if (options.Environment.Count > 0)
             {
-                environment = options.Environment
+                environmentMutations = options.Environment
                     .Select(pair => $"{pair.Key}={pair.Value}")
                     .Concat(new string?[] { null })
                     .ToArray();
             }
 
-            var controlCharacters = new Dictionary<TermSpecialControlCharacter, sbyte>
-            {
-                { TermSpecialControlCharacter.VEOF, 4 },
-                { TermSpecialControlCharacter.VEOL, -1 },
-                { TermSpecialControlCharacter.VEOL2, -1 },
-                { TermSpecialControlCharacter.VERASE, 0x7f },
-                { TermSpecialControlCharacter.VWERASE, 23 },
-                { TermSpecialControlCharacter.VKILL, 21 },
-                { TermSpecialControlCharacter.VREPRINT, 18 },
-                { TermSpecialControlCharacter.VINTR, 3 },
-                { TermSpecialControlCharacter.VQUIT, 0x1c },
-                { TermSpecialControlCharacter.VSUSP, 26 },
-                { TermSpecialControlCharacter.VSTART, 17 },
-                { TermSpecialControlCharacter.VSTOP, 19 },
-                { TermSpecialControlCharacter.VLNEXT, 22 },
-                { TermSpecialControlCharacter.VDISCARD, 15 },
-                { TermSpecialControlCharacter.VMIN, 1 },
-                { TermSpecialControlCharacter.VTIME, 0 },
-            };
-
-            var termios = new PtyTermios(
-                inputFlag: TermInputFlag.ICRNL | TermInputFlag.IXON | TermInputFlag.IXANY
-                    | TermInputFlag.IMAXBEL | TermInputFlag.BRKINT | TermInputFlag.IUTF8,
-                outputFlag: TermOutputFlag.NONE,
-                controlFlag: TermControlFlag.CREAD | TermControlFlag.CS8 | TermControlFlag.HUPCL,
-                localFlag: TermLocalFlag.ICANON | TermLocalFlag.ISIG | TermLocalFlag.IEXTEN
-                    | TermLocalFlag.ECHO | TermLocalFlag.ECHOE | TermLocalFlag.ECHOK
-                    | TermLocalFlag.ECHOKE | TermLocalFlag.ECHOCTL,
-                speed: TermSpeed.B38400,
-                controlCharacters: controlCharacters);
-
             // This synchronous native call always runs on PtySpawnQueue's dedicated worker.
             PtySpawnResult result = pty_spawn(
                 options.App,
                 terminalArgs,
-                environment,
+                environmentMutations,
                 options.Cwd,
-                ref termios,
-                ref terminalSize);
+                (ushort)options.Rows,
+                (ushort)options.Cols);
 
             if (result.Pid == -1)
             {
@@ -88,7 +52,7 @@ namespace Porta.Pty.Linux
 
             if (cancellationToken.IsCancellationRequested)
             {
-                CleanupUntrackedChild(result.MasterFd, result.Pid);
+                CleanupUntrackedChild(result.MasterFd, result.Pid, result.PidFd);
                 throw new OperationCanceledException(cancellationToken);
             }
 
@@ -96,15 +60,10 @@ namespace Porta.Pty.Linux
             PtyIoContext? ioContext = null;
             try
             {
-                int configureError = pty_configure_master(result.MasterFd);
-                if (configureError != 0)
-                {
-                    throw new InvalidOperationException(
-                        $"Configuring PTY master fd {result.MasterFd} as non-blocking failed: "
-                        + $"error={configureError} ({GetErrorMessage(configureError)}).");
-                }
-
-                processState = new PtyProcessState(result.Pid);
+                processState = new PtyProcessState(
+                    result.Pid,
+                    result.PidFd,
+                    result.PidFdError);
                 await processState.StartAsync().ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
 
@@ -117,7 +76,7 @@ namespace Porta.Pty.Linux
             {
                 if (processState is null)
                 {
-                    CleanupUntrackedChild(result.MasterFd, result.Pid);
+                    CleanupUntrackedChild(result.MasterFd, result.Pid, result.PidFd);
                 }
                 else
                 {
@@ -159,18 +118,11 @@ namespace Porta.Pty.Linux
             return new System.ComponentModel.Win32Exception(errno).Message;
         }
 
-        private static void CleanupUntrackedChild(int masterFd, int pid)
+        private static void CleanupUntrackedChild(int masterFd, int pid, int pidFd)
         {
-            TryKill(pid, SIGKILL);
-            TryClose(masterFd);
-
             try
             {
-                int status = 0;
-                while (pty_waitpid(pid, ref status, 0) == -1
-                    && Marshal.GetLastWin32Error() == EINTR)
-                {
-                }
+                _ = pty_cleanup_untracked(masterFd, pid, pidFd);
             }
             catch
             {
@@ -205,18 +157,6 @@ namespace Porta.Pty.Linux
             catch
             {
                 // Cleanup must not replace the setup exception or cancellation.
-            }
-        }
-
-        private static void TryKill(int pid, int signal)
-        {
-            try
-            {
-                _ = pty_kill(pid, signal);
-            }
-            catch
-            {
-                // Continue closing and reaping the child.
             }
         }
 

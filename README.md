@@ -15,6 +15,8 @@ PTY stream I/O and process-exit observation are non-blocking and readiness-drive
 
 `SpawnAsync` queues the inherently synchronous `forkpty` call on one dedicated process-wide spawn worker, so it does not block its caller or a ThreadPool worker. Cancellation is observed before queued work begins. Cancellation during native process creation completes only after the resulting child has been killed, its master descriptor closed, and the child reaped. `WaitForExitAsync` and `DisposeAsync` are genuinely awaitable; async disposal retires reactor ownership before closing the master descriptor and waits for child reaping. The synchronous `Stream`, `WaitForExit`, and `Dispose` methods remain blocking compatibility APIs. Resize and kill stay synchronous because their `ioctl` and signal syscalls are immediate.
 
+`SpawnAsync` snapshots the options, command-line array, and user environment mutations before enqueueing. The child inherits the host environment as it exists when the queued native spawn actually begins, then the native PTY policy sets `TERM=xterm-256color` and unsets `TMUX`, `TMUX_PANE`, `STY`, `WINDOW`, `WINDOWID`, `TERMCAP`, `COLUMNS`, and `LINES`. `PtyOptions.Environment` mutations are applied last, so they can override or unset `TERM`; an empty value means unset. Executable lookup uses this final effective environment, including a user-provided `PATH` change.
+
 Reads and writes are queued FIFO per connection. Cancellation wakes the reactor promptly. If a write is cancelled after the kernel accepted part of it, those bytes cannot be rolled back; the remaining bytes are not written.
 
 ## Installation

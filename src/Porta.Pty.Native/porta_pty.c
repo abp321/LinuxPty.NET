@@ -8,7 +8,6 @@
  * Licensed under the MIT license.
  */
 
-#include <alloca.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -43,33 +42,45 @@
 #endif
 
 typedef struct {
-    unsigned int c_iflag;
-    unsigned int c_oflag;
-    unsigned int c_cflag;
-    unsigned int c_lflag;
-    unsigned char c_cc[32];
-    unsigned int c_ispeed;
-    unsigned int c_ospeed;
-} pty_termios_t;
-
-typedef struct {
-    unsigned short ws_row;
-    unsigned short ws_col;
-    unsigned short ws_xpixel;
-    unsigned short ws_ypixel;
-} pty_winsize_t;
-
-typedef struct {
     int master_fd;
     int pid;
+    int pid_fd;
+    int pid_fd_error;
     int error;
 } pty_spawn_result_t;
+
+typedef struct {
+    int state;
+    int exit_code;
+    int signal_number;
+    int error;
+} pty_wait_result_t;
 
 typedef struct {
     uint64_t token;
     uint32_t events;
     uint32_t reserved;
 } pty_reactor_event_t;
+
+typedef char pty_spawn_result_size_must_be_20[
+    sizeof(pty_spawn_result_t) == 20 ? 1 : -1];
+typedef char pty_spawn_result_pid_offset_must_be_4[
+    offsetof(pty_spawn_result_t, pid) == 4 ? 1 : -1];
+typedef char pty_spawn_result_pid_fd_offset_must_be_8[
+    offsetof(pty_spawn_result_t, pid_fd) == 8 ? 1 : -1];
+typedef char pty_spawn_result_pid_fd_error_offset_must_be_12[
+    offsetof(pty_spawn_result_t, pid_fd_error) == 12 ? 1 : -1];
+typedef char pty_spawn_result_error_offset_must_be_16[
+    offsetof(pty_spawn_result_t, error) == 16 ? 1 : -1];
+
+typedef char pty_wait_result_size_must_be_16[
+    sizeof(pty_wait_result_t) == 16 ? 1 : -1];
+typedef char pty_wait_result_exit_code_offset_must_be_4[
+    offsetof(pty_wait_result_t, exit_code) == 4 ? 1 : -1];
+typedef char pty_wait_result_signal_offset_must_be_8[
+    offsetof(pty_wait_result_t, signal_number) == 8 ? 1 : -1];
+typedef char pty_wait_result_error_offset_must_be_12[
+    offsetof(pty_wait_result_t, error) == 12 ? 1 : -1];
 
 typedef char pty_reactor_event_size_must_be_16[
     sizeof(pty_reactor_event_t) == 16 ? 1 : -1];
@@ -95,11 +106,22 @@ enum {
     PTY_REACTOR_MAX_EVENTS = 64,
 };
 
+enum {
+    PTY_WAIT_RUNNING = 0,
+    PTY_WAIT_EXITED = 1,
+    PTY_WAIT_SIGNALED = 2,
+    PTY_WAIT_FAILED = 3,
+};
+
 /*
  * Preserve the inherited Linux spawn serialization in this cleanup pass.
  * The child never unlocks its copied mutex: every child path execs or exits.
  */
 static pthread_mutex_t pty_spawn_lock = PTHREAD_MUTEX_INITIALIZER;
+static int pidfds_unavailable;
+static int pidfds_unavailable_error;
+
+extern char** environ;
 
 static int configure_master(int master_fd)
 {
@@ -137,90 +159,267 @@ static int configure_master(int master_fd)
     return result == -1 ? errno : 0;
 }
 
+static int open_pid_fd(pid_t pid)
+{
+#ifdef SYS_pidfd_open
+    int pid_fd;
+    do {
+        pid_fd = (int)syscall(SYS_pidfd_open, pid, 0);
+    } while (pid_fd == -1 && errno == EINTR);
+
+    return pid_fd;
+#else
+    (void)pid;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static pty_wait_result_t wait_for_child(pid_t pid, int non_blocking)
+{
+    pty_wait_result_t result = { PTY_WAIT_FAILED, 0, 0, 0 };
+    int status = 0;
+    pid_t waited_pid;
+    do {
+        waited_pid = waitpid(pid, &status, non_blocking ? WNOHANG : 0);
+    } while (waited_pid == -1 && errno == EINTR);
+
+    if (waited_pid == 0) {
+        result.state = PTY_WAIT_RUNNING;
+    } else if (waited_pid == -1) {
+        result.error = errno;
+    } else if (WIFEXITED(status)) {
+        result.state = PTY_WAIT_EXITED;
+        result.exit_code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        result.state = PTY_WAIT_SIGNALED;
+        result.signal_number = WTERMSIG(status);
+    } else {
+        result.error = EIO;
+    }
+
+    return result;
+}
+
+static void free_environment(char** environment)
+{
+    if (environment == NULL) {
+        return;
+    }
+
+    for (size_t index = 0; environment[index] != NULL; index++) {
+        free(environment[index]);
+    }
+
+    free(environment);
+}
+
+static void remove_environment_key(
+    char** environment,
+    size_t* count,
+    const char* key,
+    size_t key_length)
+{
+    size_t index = 0;
+    while (index < *count) {
+        if (strncmp(environment[index], key, key_length) != 0
+            || environment[index][key_length] != '=') {
+            index++;
+            continue;
+        }
+
+        free(environment[index]);
+        (*count)--;
+        memmove(
+            &environment[index],
+            &environment[index + 1],
+            (*count - index + 1) * sizeof(char*));
+    }
+}
+
+static int apply_environment_mutation(
+    char** environment,
+    size_t* count,
+    const char* mutation)
+{
+    const char* separator = strchr(mutation, '=');
+    if (separator == NULL || separator == mutation) {
+        return 0;
+    }
+
+    size_t key_length = (size_t)(separator - mutation);
+    remove_environment_key(environment, count, mutation, key_length);
+    if (separator[1] == '\0') {
+        return 0;
+    }
+
+    char* entry = strdup(mutation);
+    if (entry == NULL) {
+        return ENOMEM;
+    }
+
+    environment[*count] = entry;
+    (*count)++;
+    environment[*count] = NULL;
+    return 0;
+}
+
+static int prepare_environment(
+    char* const mutations[],
+    char*** environment_out)
+{
+    size_t inherited_count = 0;
+    while (environ[inherited_count] != NULL) {
+        inherited_count++;
+    }
+
+    size_t mutation_count = 0;
+    if (mutations != NULL) {
+        while (mutations[mutation_count] != NULL) {
+            mutation_count++;
+        }
+    }
+
+    if (inherited_count > SIZE_MAX - mutation_count - 2
+        || inherited_count + mutation_count + 2 > SIZE_MAX / sizeof(char*)) {
+        return ENOMEM;
+    }
+
+    size_t capacity = inherited_count + mutation_count + 2;
+    char** environment = (char**)calloc(capacity, sizeof(char*));
+    if (environment == NULL) {
+        return ENOMEM;
+    }
+
+    size_t count = 0;
+    for (; count < inherited_count; count++) {
+        environment[count] = strdup(environ[count]);
+        if (environment[count] == NULL) {
+            free_environment(environment);
+            return ENOMEM;
+        }
+    }
+
+    int error = apply_environment_mutation(
+        environment,
+        &count,
+        "TERM=xterm-256color");
+    const char* fixed_unsets[] = {
+        "TMUX",
+        "TMUX_PANE",
+        "STY",
+        "WINDOW",
+        "WINDOWID",
+        "TERMCAP",
+        "COLUMNS",
+        "LINES",
+    };
+    for (size_t index = 0;
+        error == 0 && index < sizeof(fixed_unsets) / sizeof(fixed_unsets[0]);
+        index++) {
+        remove_environment_key(
+            environment,
+            &count,
+            fixed_unsets[index],
+            strlen(fixed_unsets[index]));
+    }
+
+    for (size_t index = 0;
+        error == 0 && mutations != NULL && mutations[index] != NULL;
+        index++) {
+        error = apply_environment_mutation(environment, &count, mutations[index]);
+    }
+
+    if (error != 0) {
+        free_environment(environment);
+        return error;
+    }
+
+    *environment_out = environment;
+    return 0;
+}
+
+static void initialize_terminal_settings(struct termios* term)
+{
+    memset(term, 0, sizeof(*term));
+    term->c_iflag = ICRNL | IXON | IXANY | IMAXBEL | BRKINT | IUTF8;
+    term->c_oflag = 0;
+    term->c_cflag = CREAD | CS8 | HUPCL;
+    term->c_lflag = ICANON | ISIG | IEXTEN | ECHO | ECHOE | ECHOK
+        | ECHOKE | ECHOCTL;
+    term->c_cc[VEOF] = 4;
+    term->c_cc[VEOL] = (cc_t)-1;
+    term->c_cc[VEOL2] = (cc_t)-1;
+    term->c_cc[VERASE] = 0x7f;
+    term->c_cc[VWERASE] = 23;
+    term->c_cc[VKILL] = 21;
+    term->c_cc[VREPRINT] = 18;
+    term->c_cc[VINTR] = 3;
+    term->c_cc[VQUIT] = 0x1c;
+    term->c_cc[VSUSP] = 26;
+    term->c_cc[VSTART] = 17;
+    term->c_cc[VSTOP] = 19;
+    term->c_cc[VLNEXT] = 22;
+    term->c_cc[VDISCARD] = 15;
+    term->c_cc[VMIN] = 1;
+    term->c_cc[VTIME] = 0;
+    cfsetispeed(term, B38400);
+    cfsetospeed(term, B38400);
+}
+
 /*
  * Spawns a process connected to a pseudoterminal.
  *
- * argv and envp are null-terminated arrays. envp entries use KEY=VALUE form.
- * The returned error is from forkpty() or parent-side master configuration.
+ * argv and environment_mutations are null-terminated arrays. Environment
+ * entries use KEY=VALUE form, with an empty value meaning unset. The effective
+ * inherited environment is captured immediately before forkpty().
  */
 PTY_EXPORT pty_spawn_result_t pty_spawn(
     const char* file,
     char* const argv[],
-    char* const envp[],
+    char* const environment_mutations[],
     const char* working_dir,
-    const pty_termios_t* termios_settings,
-    const pty_winsize_t* winsize_settings)
+    unsigned short rows,
+    unsigned short cols)
 {
-    pty_spawn_result_t result = { -1, -1, 0 };
+    pty_spawn_result_t result = { -1, -1, -1, 0, 0 };
 
     struct termios term;
-    struct termios* term_ptr = NULL;
-    if (termios_settings != NULL) {
-        memset(&term, 0, sizeof(term));
-        term.c_iflag = termios_settings->c_iflag;
-        term.c_oflag = termios_settings->c_oflag;
-        term.c_cflag = termios_settings->c_cflag;
-        term.c_lflag = termios_settings->c_lflag;
-
-        size_t cc_size = sizeof(term.c_cc);
-        if (cc_size > 32) {
-            cc_size = 32;
-        }
-
-        memcpy(term.c_cc, termios_settings->c_cc, cc_size);
-        cfsetispeed(&term, termios_settings->c_ispeed);
-        cfsetospeed(&term, termios_settings->c_ospeed);
-        term_ptr = &term;
-    }
+    initialize_terminal_settings(&term);
 
     struct winsize window_size;
-    struct winsize* window_size_ptr = NULL;
-    if (winsize_settings != NULL) {
-        window_size.ws_row = winsize_settings->ws_row;
-        window_size.ws_col = winsize_settings->ws_col;
-        window_size.ws_xpixel = winsize_settings->ws_xpixel;
-        window_size.ws_ypixel = winsize_settings->ws_ypixel;
-        window_size_ptr = &window_size;
-    }
+    window_size.ws_row = rows;
+    window_size.ws_col = cols;
+    window_size.ws_xpixel = 0;
+    window_size.ws_ypixel = 0;
 
     int master_fd = -1;
+    char** child_environment = NULL;
     pthread_mutex_lock(&pty_spawn_lock);
-    pid_t pid = forkpty(&master_fd, NULL, term_ptr, window_size_ptr);
+    int environment_error = prepare_environment(
+        environment_mutations,
+        &child_environment);
+    if (environment_error != 0) {
+        pthread_mutex_unlock(&pty_spawn_lock);
+        result.error = environment_error;
+        return result;
+    }
+
+    pid_t pid = forkpty(&master_fd, NULL, &term, &window_size);
     int spawn_errno = errno;
 
     if (pid == -1) {
         pthread_mutex_unlock(&pty_spawn_lock);
+        free_environment(child_environment);
         result.error = spawn_errno;
         return result;
     }
 
     if (pid == 0) {
+        environ = child_environment;
         if (working_dir != NULL && working_dir[0] != '\0') {
             if (chdir(working_dir) == -1) {
                 _exit(errno);
-            }
-        }
-
-        if (getenv("TERM") == NULL) {
-            setenv("TERM", "xterm-256color", 0);
-        }
-
-        if (envp != NULL) {
-            for (int index = 0; envp[index] != NULL; index++) {
-                char* separator = strchr(envp[index], '=');
-                if (separator != NULL) {
-                    size_t key_length = (size_t)(separator - envp[index]);
-                    char* key = (char*)alloca(key_length + 1);
-                    memcpy(key, envp[index], key_length);
-                    key[key_length] = '\0';
-
-                    const char* value = separator + 1;
-                    if (value[0] == '\0') {
-                        unsetenv(key);
-                    } else {
-                        setenv(key, value, 1);
-                    }
-                }
             }
         }
 
@@ -232,26 +431,38 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
     if (configure_error != 0) {
         kill(pid, SIGKILL);
         close(master_fd);
-
-        int status;
-        while (waitpid(pid, &status, 0) == -1 && errno == EINTR) {
-        }
+        (void)wait_for_child(pid, 0);
 
         pthread_mutex_unlock(&pty_spawn_lock);
+        free_environment(child_environment);
         result.error = configure_error;
         return result;
     }
 
+    int pid_fd = -1;
+    int pid_fd_error = 0;
+    if (pidfds_unavailable) {
+        pid_fd_error = pidfds_unavailable_error;
+    } else {
+        pid_fd = open_pid_fd(pid);
+        if (pid_fd == -1) {
+            pid_fd_error = errno;
+            if (pid_fd_error == ENOSYS || pid_fd_error == EINVAL
+                || pid_fd_error == EPERM) {
+                pidfds_unavailable = 1;
+                pidfds_unavailable_error = pid_fd_error;
+            }
+        }
+    }
+
     pthread_mutex_unlock(&pty_spawn_lock);
+    free_environment(child_environment);
 
     result.master_fd = master_fd;
     result.pid = pid;
+    result.pid_fd = pid_fd;
+    result.pid_fd_error = pid_fd_error;
     return result;
-}
-
-PTY_EXPORT int pty_configure_master(int master_fd)
-{
-    return configure_master(master_fd);
 }
 
 PTY_EXPORT int pty_reactor_create(
@@ -502,28 +713,12 @@ PTY_EXPORT int pty_kill(int pid, int signal_number)
     return kill(pid, signal_number);
 }
 
-PTY_EXPORT int pty_waitpid(int pid, int* status, int options)
+PTY_EXPORT pty_wait_result_t pty_wait_child(int pid, int non_blocking)
 {
-    return waitpid(pid, status, options);
+    return wait_for_child(pid, non_blocking);
 }
 
-PTY_EXPORT int pty_pidfd_open(int pid)
-{
-#ifdef SYS_pidfd_open
-    int pid_fd;
-    do {
-        pid_fd = (int)syscall(SYS_pidfd_open, pid, 0);
-    } while (pid_fd == -1 && errno == EINTR);
-
-    return pid_fd;
-#else
-    (void)pid;
-    errno = ENOSYS;
-    return -1;
-#endif
-}
-
-PTY_EXPORT int pty_pidfd_send_signal(int pid_fd, int signal_number)
+static int send_pid_fd_signal(int pid_fd, int signal_number)
 {
 #ifdef SYS_pidfd_send_signal
     int result;
@@ -543,6 +738,39 @@ PTY_EXPORT int pty_pidfd_send_signal(int pid_fd, int signal_number)
     errno = ENOSYS;
     return -1;
 #endif
+}
+
+PTY_EXPORT int pty_pidfd_send_signal(int pid_fd, int signal_number)
+{
+    return send_pid_fd_signal(pid_fd, signal_number);
+}
+
+PTY_EXPORT int pty_cleanup_untracked(int master_fd, int pid, int pid_fd)
+{
+    int first_error = 0;
+    int signal_result = pid_fd >= 0
+        ? send_pid_fd_signal(pid_fd, SIGKILL)
+        : kill(pid, SIGKILL);
+    if (signal_result == -1 && errno != ESRCH) {
+        first_error = errno;
+    }
+
+    if (master_fd >= 0 && close(master_fd) == -1 && first_error == 0) {
+        first_error = errno;
+    }
+
+    if (pid_fd >= 0 && close(pid_fd) == -1 && first_error == 0) {
+        first_error = errno;
+    }
+
+    pty_wait_result_t wait_result = wait_for_child(pid, 0);
+    if (wait_result.state == PTY_WAIT_FAILED
+        && wait_result.error != ECHILD
+        && first_error == 0) {
+        first_error = wait_result.error;
+    }
+
+    return first_error;
 }
 
 PTY_EXPORT int pty_close(int master_fd)

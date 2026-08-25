@@ -15,28 +15,26 @@ namespace Porta.Pty.Linux
     /// </summary>
     internal sealed class PtyProcessState
     {
-        private const int EPERM = 1;
-        private const int EINVAL = 22;
-        private const int ENOSYS = 38;
-        private const int EINTR = 4;
-        private const int SignalMask = 127;
-        private const int ExitCodeMask = 255;
-
-        private static int pidFdsUnavailable;
-
         private readonly int pid;
         private readonly EpollReactor reactor;
         private readonly Lock reapGate = new();
         private readonly TaskCompletionSource<int> exitCompletion = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
-        private int pidFileDescriptor = -1;
+        private int pidFileDescriptor;
         private ulong activeToken;
         private LifetimeState lifetimeState;
         private int exitCode;
 
-        internal PtyProcessState(int pid)
+        internal PtyProcessState(int pid, int pidFileDescriptor, int pidFileDescriptorError)
         {
+            if ((pidFileDescriptor >= 0) != (pidFileDescriptorError == 0))
+            {
+                throw new InvalidOperationException(
+                    "The native spawn returned an inconsistent pidfd result.");
+            }
+
             this.pid = pid;
+            this.pidFileDescriptor = pidFileDescriptor;
             this.reactor = EpollReactor.Shared;
         }
 
@@ -86,42 +84,29 @@ namespace Porta.Pty.Linux
 
         internal async Task StartAsync()
         {
-            if (Volatile.Read(ref pidFdsUnavailable) == 0)
+            if (this.pidFileDescriptor >= 0)
             {
-                int pidFd = pty_pidfd_open(this.pid);
-                if (pidFd >= 0)
+                lock (this.reapGate)
+                {
+                    this.lifetimeState = LifetimeState.RegisteringEpoll;
+                }
+
+                try
+                {
+                    await this.reactor.RegisterProcessAsync(this).ConfigureAwait(false);
+                    return;
+                }
+                catch
                 {
                     lock (this.reapGate)
                     {
-                        this.pidFileDescriptor = pidFd;
-                        this.lifetimeState = LifetimeState.RegisteringEpoll;
-                    }
-
-                    try
-                    {
-                        await this.reactor.RegisterProcessAsync(this).ConfigureAwait(false);
-                        return;
-                    }
-                    catch
-                    {
-                        lock (this.reapGate)
+                        if (this.lifetimeState != LifetimeState.RegisteringEpoll)
                         {
-                            if (this.lifetimeState != LifetimeState.RegisteringEpoll)
-                            {
-                                throw new InvalidOperationException(
-                                    "The pidfd registration did not return ownership.");
-                            }
-
-                            this.lifetimeState = LifetimeState.Unowned;
+                            throw new InvalidOperationException(
+                                "The pidfd registration did not return ownership.");
                         }
-                    }
-                }
-                else
-                {
-                    int error = Marshal.GetLastWin32Error();
-                    if (error == ENOSYS || error == EINVAL || error == EPERM)
-                    {
-                        Volatile.Write(ref pidFdsUnavailable, 1);
+
+                        this.lifetimeState = LifetimeState.Unowned;
                     }
                 }
             }
@@ -216,30 +201,26 @@ namespace Porta.Pty.Linux
                     return false;
                 }
 
-                int status = 0;
-                int result;
-                do
-                {
-                    result = pty_waitpid(this.pid, ref status, WaitNoHang);
-                }
-                while (result == -1 && Marshal.GetLastWin32Error() == EINTR);
-
-                if (result == 0)
+                PtyWaitResult result = pty_wait_child(this.pid, NonBlockingWait);
+                if (result.State == PtyWaitState.Running)
                 {
                     return false;
                 }
 
                 this.lifetimeState = LifetimeState.Reaping;
-                if (result == this.pid)
+                if (result.State == PtyWaitState.Exited)
                 {
-                    exitCode = DecodeExitCode(status);
+                    exitCode = result.ExitCode;
+                }
+                else if (result.State == PtyWaitState.Signaled)
+                {
+                    exitCode = 0;
                 }
                 else
                 {
-                    int error = Marshal.GetLastWin32Error();
                     failure = EpollReactor.CreateIOException(
                         $"Reaping PTY child process {this.pid}",
-                        error);
+                        result.Error);
                 }
 
                 return true;
@@ -318,26 +299,23 @@ namespace Porta.Pty.Linux
                 this.lifetimeState = LifetimeState.Reaping;
             }
 
-            int status = 0;
-            int result;
-            do
-            {
-                result = pty_waitpid(this.pid, ref status, 0);
-            }
-            while (result == -1 && Marshal.GetLastWin32Error() == EINTR);
+            PtyWaitResult result = pty_wait_child(this.pid, nonBlocking: 0);
 
             int exitCode = 0;
             Exception? failure = null;
-            if (result == this.pid)
+            if (result.State == PtyWaitState.Exited)
             {
-                exitCode = DecodeExitCode(status);
+                exitCode = result.ExitCode;
+            }
+            else if (result.State == PtyWaitState.Signaled)
+            {
+                exitCode = 0;
             }
             else
             {
-                int error = Marshal.GetLastWin32Error();
                 failure = EpollReactor.CreateIOException(
                     $"Reaping untracked PTY child process {this.pid}",
-                    error);
+                    result.Error);
             }
 
             lock (this.reapGate)
@@ -347,12 +325,6 @@ namespace Porta.Pty.Linux
             }
 
             this.CompleteReaping(exitCode, failure);
-        }
-
-        private static int DecodeExitCode(int status)
-        {
-            int exitSignal = status & SignalMask;
-            return exitSignal == 0 ? (status >> 8) & ExitCodeMask : 0;
         }
 
         private void RegisterFallback()

@@ -4,7 +4,6 @@
 namespace Porta.Pty.Linux
 {
     using System;
-    using System.Collections.Generic;
     using System.Runtime.InteropServices;
     using System.Runtime.InteropServices.Marshalling;
 
@@ -12,7 +11,7 @@ namespace Porta.Pty.Linux
     {
         internal const int SIGHUP = 1;
         internal const int SIGKILL = 9;
-        internal const int WaitNoHang = 1;
+        internal const int NonBlockingWait = 1;
 
         internal const int ReactorAdd = 1;
         internal const int ReactorModify = 2;
@@ -25,73 +24,46 @@ namespace Porta.Pty.Linux
 
         private const string LibPortaPty = "libporta_pty";
 
-        internal enum TermSpeed : uint
+        internal enum PtyWaitState
         {
-            B38400 = 0x0F,
+            Running = 0,
+            Exited = 1,
+            Signaled = 2,
+            Failed = 3,
         }
 
-        [Flags]
-        internal enum TermInputFlag : uint
-        {
-            BRKINT = 0x2,
-            ICRNL = 0x100,
-            IXON = 0x400,
-            IXANY = 0x800,
-            IMAXBEL = 0x2000,
-            IUTF8 = 0x4000,
-        }
-
-        internal enum TermOutputFlag : uint
-        {
-            NONE = 0,
-        }
-
-        [Flags]
-        internal enum TermControlFlag : uint
-        {
-            CS8 = 0x30,
-            CREAD = 0x80,
-            HUPCL = 0x400,
-        }
-
-        [Flags]
-        internal enum TermLocalFlag : uint
-        {
-            ECHOKE = 0x800,
-            ECHOE = 0x10,
-            ECHOK = 0x20,
-            ECHO = 0x8,
-            ECHOCTL = 0x200,
-            ISIG = 0x1,
-            ICANON = 0x2,
-            IEXTEN = 0x8000,
-        }
-
-        internal enum TermSpecialControlCharacter
-        {
-            VEOF = 4,
-            VEOL = 11,
-            VEOL2 = 16,
-            VERASE = 2,
-            VWERASE = 14,
-            VKILL = 3,
-            VREPRINT = 12,
-            VINTR = 0,
-            VQUIT = 1,
-            VSUSP = 10,
-            VSTART = 8,
-            VSTOP = 9,
-            VLNEXT = 15,
-            VDISCARD = 13,
-            VMIN = 6,
-            VTIME = 5,
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
+        [StructLayout(LayoutKind.Explicit, Size = 20)]
         internal struct PtySpawnResult
         {
+            [FieldOffset(0)]
             public int MasterFd;
+
+            [FieldOffset(4)]
             public int Pid;
+
+            [FieldOffset(8)]
+            public int PidFd;
+
+            [FieldOffset(12)]
+            public int PidFdError;
+
+            [FieldOffset(16)]
+            public int Error;
+        }
+
+        [StructLayout(LayoutKind.Explicit, Size = 16)]
+        internal struct PtyWaitResult
+        {
+            [FieldOffset(0)]
+            public PtyWaitState State;
+
+            [FieldOffset(4)]
+            public int ExitCode;
+
+            [FieldOffset(8)]
+            public int Signal;
+
+            [FieldOffset(12)]
             public int Error;
         }
 
@@ -108,70 +80,16 @@ namespace Porta.Pty.Linux
             public uint Reserved;
         }
 
-        [StructLayout(LayoutKind.Sequential)]
-        internal struct PtyTermios
-        {
-            public uint IFlag;
-            public uint OFlag;
-            public uint CFlag;
-            public uint LFlag;
-
-            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
-            public byte[] CC;
-
-            public uint ISpeed;
-            public uint OSpeed;
-
-            public PtyTermios(
-                TermInputFlag inputFlag,
-                TermOutputFlag outputFlag,
-                TermControlFlag controlFlag,
-                TermLocalFlag localFlag,
-                TermSpeed speed,
-                IDictionary<TermSpecialControlCharacter, sbyte> controlCharacters)
-            {
-                this.IFlag = (uint)inputFlag;
-                this.OFlag = (uint)outputFlag;
-                this.CFlag = (uint)controlFlag;
-                this.LFlag = (uint)localFlag;
-                this.CC = new byte[32];
-                foreach (var pair in controlCharacters)
-                {
-                    this.CC[(int)pair.Key] = (byte)pair.Value;
-                }
-
-                this.ISpeed = (uint)speed;
-                this.OSpeed = (uint)speed;
-            }
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        internal struct PtyWinSize
-        {
-            public ushort Rows;
-            public ushort Cols;
-            public ushort XPixel;
-            public ushort YPixel;
-
-            public PtyWinSize(ushort rows, ushort cols)
-            {
-                this.Rows = rows;
-                this.Cols = cols;
-                this.XPixel = 0;
-                this.YPixel = 0;
-            }
-        }
-
         // The source-generated marshaller cannot preserve null-terminated UTF-8
-        // char** argv/envp plus PtyTermios's inline c_cc array without custom marshalling.
-        [DllImport(LibPortaPty, SetLastError = true)]
+        // char** argv and environment-mutation arrays without custom marshalling.
+        [DllImport(LibPortaPty)]
         internal static extern PtySpawnResult pty_spawn(
             [MarshalAs(UnmanagedType.LPStr)] string file,
             [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPStr)] string?[] argv,
-            [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPStr)] string?[]? envp,
+            [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPStr)] string?[]? environmentMutations,
             [MarshalAs(UnmanagedType.LPStr)] string? workingDir,
-            ref PtyTermios termios,
-            ref PtyWinSize winsize);
+            ushort rows,
+            ushort cols);
 
         [LibraryImport(LibPortaPty, SetLastError = true)]
         internal static partial int pty_resize(int masterFd, ushort rows, ushort cols);
@@ -179,11 +97,8 @@ namespace Porta.Pty.Linux
         [LibraryImport(LibPortaPty, SetLastError = true)]
         internal static partial int pty_kill(int pid, int signal);
 
-        [LibraryImport(LibPortaPty, SetLastError = true)]
-        internal static partial int pty_waitpid(int pid, ref int status, int options);
-
-        [LibraryImport(LibPortaPty, SetLastError = true)]
-        internal static partial int pty_pidfd_open(int pid);
+        [LibraryImport(LibPortaPty)]
+        internal static partial PtyWaitResult pty_wait_child(int pid, int nonBlocking);
 
         [LibraryImport(LibPortaPty, SetLastError = true)]
         internal static partial int pty_pidfd_send_signal(int pidFd, int signal);
@@ -192,7 +107,7 @@ namespace Porta.Pty.Linux
         internal static partial int pty_close(int masterFd);
 
         [LibraryImport(LibPortaPty)]
-        internal static partial int pty_configure_master(int masterFd);
+        internal static partial int pty_cleanup_untracked(int masterFd, int pid, int pidFd);
 
         [LibraryImport(LibPortaPty)]
         internal static partial int pty_reactor_create(

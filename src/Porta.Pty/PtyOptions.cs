@@ -37,7 +37,8 @@ namespace Porta.Pty
         public string[] CommandLine { get; set; } = Array.Empty<string>();
 
         /// <summary>
-        /// Gets or sets the process environment variables.
+        /// Gets or sets environment mutations applied after the inherited host
+        /// environment and the fixed PTY policy. An empty value unsets the variable.
         /// </summary>
         public IDictionary<string, string> Environment { get; set; } = new Dictionary<string, string>();
     }
