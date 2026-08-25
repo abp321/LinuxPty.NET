@@ -4,6 +4,11 @@
  * This library keeps forkpty() and execvp() entirely in native code so no
  * managed .NET code runs in the forked child process.
  *
+ * On the pidfd-capable path the forked child opens its own pidfd and hands it
+ * to the parent over a close-on-exec AF_UNIX socketpair before the parent
+ * releases it to chdir and exec, so no descriptor is ever resolved from a
+ * numeric PID that could already have been recycled.
+ *
  * Copyright (c) Microsoft Corporation. All rights reserved.
  * Licensed under the MIT license.
  */
@@ -21,6 +26,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -65,6 +71,30 @@ typedef struct {
     uint32_t events;
     uint32_t reserved;
 } pty_reactor_event_t;
+
+enum {
+    PTY_CONTROL_MAGIC = 0x50545943,
+    PTY_CONTROL_RELEASE_MAGIC = 0x50545952,
+    PTY_CONTROL_STATUS_PIDFD = 1,
+    PTY_CONTROL_STATUS_NO_PIDFD = 2,
+    PTY_CONTROL_STATUS_RELEASE = 3,
+};
+
+typedef struct {
+    uint32_t magic;
+    uint32_t status;
+    int32_t error;
+    int32_t pid;
+} pty_control_message_t;
+
+typedef char pty_control_message_size_must_be_16[
+    sizeof(pty_control_message_t) == 16 ? 1 : -1];
+typedef char pty_control_message_status_offset_must_be_4[
+    offsetof(pty_control_message_t, status) == 4 ? 1 : -1];
+typedef char pty_control_message_error_offset_must_be_8[
+    offsetof(pty_control_message_t, error) == 8 ? 1 : -1];
+typedef char pty_control_message_pid_offset_must_be_12[
+    offsetof(pty_control_message_t, pid) == 12 ? 1 : -1];
 
 typedef char pty_spawn_result_size_must_be_20[
     sizeof(pty_spawn_result_t) == 20 ? 1 : -1];
@@ -123,9 +153,8 @@ enum {
  * The child never unlocks its copied mutex: every child path execs or exits.
  */
 static pthread_mutex_t pty_spawn_lock = PTHREAD_MUTEX_INITIALIZER;
-static int pidfds_unavailable;
-static int pidfds_unavailable_error;
-static int pidfd_wait_supported;
+static int pidfd_support_probed;
+static int pidfd_support_error;
 
 extern char** environ;
 
@@ -206,6 +235,22 @@ static int probe_pid_fd_wait_support(void)
     }
 
     return wait_result == -1 ? errno : EIO;
+}
+
+static int probe_pid_fd_support(void)
+{
+    int pid_fd = open_pid_fd(getpid());
+    if (pid_fd == -1) {
+        return errno == 0 ? ENOSYS : errno;
+    }
+
+    close(pid_fd);
+    return probe_pid_fd_wait_support();
+}
+
+static int is_pidfd_unsupported_error(int error)
+{
+    return error == ENOSYS || error == EINVAL || error == EPERM;
 }
 
 static pty_wait_result_t wait_for_child(
@@ -456,6 +501,332 @@ static void initialize_terminal_settings(struct termios* term)
     cfsetospeed(term, B38400);
 }
 
+static int send_pid_fd_signal(int pid_fd, int signal_number)
+{
+#ifdef SYS_pidfd_send_signal
+    int result;
+    do {
+        result = (int)syscall(
+            SYS_pidfd_send_signal,
+            pid_fd,
+            signal_number,
+            NULL,
+            0);
+    } while (result == -1 && errno == EINTR);
+
+    return result;
+#else
+    (void)pid_fd;
+    (void)signal_number;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static int reserve_control_descriptor(int* descriptor)
+{
+    /* login_tty() inside forkpty dup2()s the slave onto 0, 1 and 2. */
+    if (*descriptor >= 3) {
+        return 0;
+    }
+
+    int reserved;
+    do {
+        reserved = fcntl(*descriptor, F_DUPFD_CLOEXEC, 3);
+    } while (reserved == -1 && errno == EINTR);
+
+    if (reserved == -1) {
+        return errno;
+    }
+
+    close(*descriptor);
+    *descriptor = reserved;
+    return 0;
+}
+
+static int create_control_channel(int descriptors[2])
+{
+    int result;
+    do {
+        result = socketpair(
+            AF_UNIX,
+            SOCK_SEQPACKET | SOCK_CLOEXEC,
+            0,
+            descriptors);
+    } while (result == -1 && errno == EINTR);
+
+    if (result == -1) {
+        return errno;
+    }
+
+    for (int index = 0; index < 2; index++) {
+        int error = reserve_control_descriptor(&descriptors[index]);
+        if (error != 0) {
+            close(descriptors[0]);
+            close(descriptors[1]);
+            return error;
+        }
+    }
+
+    return 0;
+}
+
+static int send_control_message(
+    int socket_fd,
+    const pty_control_message_t* message,
+    int transferred_fd)
+{
+    struct iovec io;
+    io.iov_base = (void*)(uintptr_t)message;
+    io.iov_len = sizeof(*message);
+
+    union {
+        struct cmsghdr alignment;
+        char bytes[CMSG_SPACE(sizeof(int))];
+    } control;
+    memset(&control, 0, sizeof(control));
+
+    struct msghdr header;
+    memset(&header, 0, sizeof(header));
+    header.msg_iov = &io;
+    header.msg_iovlen = 1;
+
+    if (transferred_fd >= 0) {
+        header.msg_control = control.bytes;
+        header.msg_controllen = sizeof(control.bytes);
+
+        struct cmsghdr* cmsg = CMSG_FIRSTHDR(&header);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cmsg), &transferred_fd, sizeof(transferred_fd));
+    }
+
+    ssize_t sent;
+    do {
+        sent = sendmsg(socket_fd, &header, MSG_NOSIGNAL);
+    } while (sent == -1 && errno == EINTR);
+
+    if (sent == -1) {
+        return errno;
+    }
+
+    return sent == (ssize_t)sizeof(*message) ? 0 : EPROTO;
+}
+
+static int receive_control_message(
+    int socket_fd,
+    pty_control_message_t* message,
+    int* received_fd)
+{
+    memset(message, 0, sizeof(*message));
+    *received_fd = -1;
+
+    struct iovec io;
+    io.iov_base = message;
+    io.iov_len = sizeof(*message);
+
+    /* Room for two descriptors so an unexpected extra one is observable. */
+    union {
+        struct cmsghdr alignment;
+        char bytes[CMSG_SPACE(sizeof(int) * 2)];
+    } control;
+    memset(&control, 0, sizeof(control));
+
+    struct msghdr header;
+    memset(&header, 0, sizeof(header));
+    header.msg_iov = &io;
+    header.msg_iovlen = 1;
+    header.msg_control = control.bytes;
+    header.msg_controllen = sizeof(control.bytes);
+
+    ssize_t received;
+    do {
+        received = recvmsg(socket_fd, &header, MSG_CMSG_CLOEXEC);
+    } while (received == -1 && errno == EINTR);
+
+    if (received == -1) {
+        return errno;
+    }
+
+    int error = 0;
+    for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&header);
+        cmsg != NULL;
+        cmsg = CMSG_NXTHDR(&header, cmsg)) {
+        if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
+            if (error == 0) {
+                error = EPROTO;
+            }
+
+            continue;
+        }
+
+        size_t payload_length = (size_t)cmsg->cmsg_len - CMSG_LEN(0);
+        if (payload_length % sizeof(int) != 0 && error == 0) {
+            error = EPROTO;
+        }
+
+        for (size_t offset = 0;
+            offset + sizeof(int) <= payload_length;
+            offset += sizeof(int)) {
+            int descriptor;
+            memcpy(&descriptor, CMSG_DATA(cmsg) + offset, sizeof(descriptor));
+            if (error == 0 && *received_fd < 0) {
+                *received_fd = descriptor;
+                continue;
+            }
+
+            close(descriptor);
+            if (error == 0) {
+                error = EPROTO;
+            }
+        }
+    }
+
+    if ((header.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0 && error == 0) {
+        error = EPROTO;
+    }
+
+    if (received == 0) {
+        if (error == 0) {
+            error = EPIPE;
+        }
+    } else if (received != (ssize_t)sizeof(*message) && error == 0) {
+        error = EPROTO;
+    }
+
+    if (error != 0 && *received_fd >= 0) {
+        close(*received_fd);
+        *received_fd = -1;
+    }
+
+    return error;
+}
+
+static int validate_control_message(
+    const pty_control_message_t* message,
+    pid_t pid,
+    int received_fd)
+{
+    if (message->magic != PTY_CONTROL_MAGIC
+        || message->pid != (int32_t)pid) {
+        return EPROTO;
+    }
+
+    if (message->status == PTY_CONTROL_STATUS_PIDFD) {
+        return received_fd >= 0 && message->error == 0 ? 0 : EPROTO;
+    }
+
+    if (message->status == PTY_CONTROL_STATUS_NO_PIDFD) {
+        return received_fd < 0 && message->error != 0 ? 0 : EPROTO;
+    }
+
+    return EPROTO;
+}
+
+static int send_release_message(int socket_fd)
+{
+    pty_control_message_t message;
+    memset(&message, 0, sizeof(message));
+    message.magic = PTY_CONTROL_RELEASE_MAGIC;
+    message.status = PTY_CONTROL_STATUS_RELEASE;
+    return send_control_message(socket_fd, &message, -1);
+}
+
+static int receive_release_message(int socket_fd)
+{
+    pty_control_message_t message;
+    int received_fd = -1;
+    int error = receive_control_message(socket_fd, &message, &received_fd);
+    if (received_fd >= 0) {
+        close(received_fd);
+        if (error == 0) {
+            error = EPROTO;
+        }
+    }
+
+    if (error != 0) {
+        return error;
+    }
+
+    if (message.magic != PTY_CONTROL_RELEASE_MAGIC
+        || message.status != PTY_CONTROL_STATUS_RELEASE) {
+        return EPROTO;
+    }
+
+    return 0;
+}
+
+/*
+ * Runs in the forked child: nothing here may allocate, use stdio or lock,
+ * because the child inherited the parent's libc locks in an arbitrary state.
+ */
+static int perform_child_handshake(
+    int control_fd,
+    int acquire_pid_fd,
+    int unsupported_error)
+{
+    pty_control_message_t message;
+    memset(&message, 0, sizeof(message));
+    message.magic = PTY_CONTROL_MAGIC;
+    message.status = PTY_CONTROL_STATUS_NO_PIDFD;
+    message.error = unsupported_error;
+    message.pid = (int32_t)getpid();
+
+    int pid_fd = -1;
+    if (acquire_pid_fd != 0) {
+        pid_fd = open_pid_fd(getpid());
+        if (pid_fd == -1) {
+            message.error = errno == 0 ? ENOSYS : errno;
+        } else {
+            message.status = PTY_CONTROL_STATUS_PIDFD;
+            message.error = 0;
+        }
+    }
+
+    int send_error = send_control_message(control_fd, &message, pid_fd);
+    if (pid_fd >= 0) {
+        /* The in-flight SCM_RIGHTS copy holds the kernel reference. */
+        close(pid_fd);
+    }
+
+    if (send_error != 0) {
+        return send_error;
+    }
+
+    return receive_release_message(control_fd);
+}
+
+static void abort_spawned_child(
+    pid_t pid,
+    int master_fd,
+    int pid_fd,
+    int control_fd,
+    int child_held)
+{
+    if (pid_fd >= 0) {
+        (void)send_pid_fd_signal(pid_fd, SIGKILL);
+    } else if (child_held != 0) {
+        (void)kill(pid, SIGKILL);
+    }
+
+    /* Without either, the child already exited and its PID may be recycled. */
+
+    if (control_fd >= 0) {
+        close(control_fd);
+    }
+
+    (void)wait_for_child(pid, pid_fd, 0);
+
+    if (master_fd >= 0) {
+        close(master_fd);
+    }
+
+    if (pid_fd >= 0) {
+        close(pid_fd);
+    }
+}
+
 /*
  * Spawns a process connected to a pseudoterminal.
  *
@@ -496,10 +867,39 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
         return result;
     }
 
+    if (!pidfd_support_probed) {
+        int probe_error = probe_pid_fd_support();
+        if (probe_error != 0 && !is_pidfd_unsupported_error(probe_error)) {
+            /* Transient: latching it would strand a capable process on PIDs. */
+            pthread_mutex_unlock(&pty_spawn_lock);
+            free_environment(child_environment);
+            result.error = probe_error;
+            return result;
+        }
+
+        pidfd_support_error = probe_error;
+        pidfd_support_probed = 1;
+    }
+
+    /* The child must read only its own stack copies of these. */
+    int unsupported_error = pidfd_support_error;
+    int acquire_pid_fd = unsupported_error == 0;
+
+    int descriptors[2];
+    int channel_error = create_control_channel(descriptors);
+    if (channel_error != 0) {
+        pthread_mutex_unlock(&pty_spawn_lock);
+        free_environment(child_environment);
+        result.error = channel_error;
+        return result;
+    }
+
     pid_t pid = forkpty(&master_fd, NULL, &term, &window_size);
     int spawn_errno = errno;
 
     if (pid == -1) {
+        close(descriptors[0]);
+        close(descriptors[1]);
         pthread_mutex_unlock(&pty_spawn_lock);
         free_environment(child_environment);
         result.error = spawn_errno;
@@ -507,6 +907,16 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
     }
 
     if (pid == 0) {
+        close(descriptors[0]);
+        int handshake_error = perform_child_handshake(
+            descriptors[1],
+            acquire_pid_fd,
+            unsupported_error);
+        if (handshake_error != 0) {
+            _exit(handshake_error);
+        }
+
+        close(descriptors[1]);
         environ = child_environment;
         if (working_dir != NULL && working_dir[0] != '\0') {
             if (chdir(working_dir) == -1) {
@@ -518,46 +928,57 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
         _exit(errno);
     }
 
-    int configure_error = configure_master(master_fd);
-    if (configure_error != 0) {
-        kill(pid, SIGKILL);
-        close(master_fd);
-        (void)wait_for_child(pid, -1, 0);
+    /* Closing the parent's copy of the child endpoint makes its EOF visible. */
+    close(descriptors[1]);
+    descriptors[1] = -1;
 
+    pty_control_message_t message;
+    int received_fd = -1;
+    int error = receive_control_message(descriptors[0], &message, &received_fd);
+
+    /* Only a zero-length receive proves the child could already have exited. */
+    int child_held = error != EPIPE && error != ECONNRESET;
+    if (error == 0) {
+        error = validate_control_message(&message, pid, received_fd);
+        if (error != 0 && received_fd >= 0) {
+            close(received_fd);
+            received_fd = -1;
+        }
+    }
+
+    int pid_fd = received_fd;
+    int pid_fd_error = 0;
+    if (error == 0 && message.status == PTY_CONTROL_STATUS_NO_PIDFD) {
+        pid_fd_error = message.error;
+        if (acquire_pid_fd != 0 && !is_pidfd_unsupported_error(pid_fd_error)) {
+            /* Proven support plus a local failure must not silently downgrade. */
+            error = pid_fd_error;
+        } else {
+            pidfd_support_error = pid_fd_error;
+        }
+    }
+
+    if (error == 0) {
+        error = configure_master(master_fd);
+    }
+
+    if (error == 0) {
+        error = send_release_message(descriptors[0]);
+        if (error == EPIPE || error == ECONNRESET) {
+            /* The child endpoint is gone, so the child may already be reaped. */
+            child_held = 0;
+        }
+    }
+
+    if (error != 0) {
+        abort_spawned_child(pid, master_fd, pid_fd, descriptors[0], child_held);
         pthread_mutex_unlock(&pty_spawn_lock);
         free_environment(child_environment);
-        result.error = configure_error;
+        result.error = error;
         return result;
     }
 
-    int pid_fd = -1;
-    int pid_fd_error = 0;
-    if (pidfds_unavailable) {
-        pid_fd_error = pidfds_unavailable_error;
-    } else {
-        if (!pidfd_wait_supported) {
-            pid_fd_error = probe_pid_fd_wait_support();
-            if (pid_fd_error == 0) {
-                pidfd_wait_supported = 1;
-            } else {
-                pidfds_unavailable = 1;
-                pidfds_unavailable_error = pid_fd_error;
-            }
-        }
-
-        if (!pidfds_unavailable) {
-            pid_fd = open_pid_fd(pid);
-            if (pid_fd == -1) {
-                pid_fd_error = errno;
-                if (pid_fd_error == ENOSYS || pid_fd_error == EINVAL
-                    || pid_fd_error == EPERM) {
-                    pidfds_unavailable = 1;
-                    pidfds_unavailable_error = pid_fd_error;
-                }
-            }
-        }
-    }
-
+    close(descriptors[0]);
     pthread_mutex_unlock(&pty_spawn_lock);
     free_environment(child_environment);
 
@@ -822,28 +1243,6 @@ PTY_EXPORT pty_wait_result_t pty_wait_child(
     int non_blocking)
 {
     return wait_for_child(pid, pid_fd, non_blocking);
-}
-
-static int send_pid_fd_signal(int pid_fd, int signal_number)
-{
-#ifdef SYS_pidfd_send_signal
-    int result;
-    do {
-        result = (int)syscall(
-            SYS_pidfd_send_signal,
-            pid_fd,
-            signal_number,
-            NULL,
-            0);
-    } while (result == -1 && errno == EINTR);
-
-    return result;
-#else
-    (void)pid_fd;
-    (void)signal_number;
-    errno = ENOSYS;
-    return -1;
-#endif
 }
 
 PTY_EXPORT int pty_pidfd_send_signal(int pid_fd, int signal_number)
