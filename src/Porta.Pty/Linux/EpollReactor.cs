@@ -22,13 +22,13 @@ namespace Porta.Pty.Linux
         private const int MaxCommandsPerDrain = 16;
         private const int ENOENT = 2;
 
-        private static readonly object SharedGate = new();
+        private static readonly Lock SharedGate = new();
         private static EpollReactor? shared;
 
         private readonly int epollFd;
         private readonly int wakeFd;
         private readonly ConcurrentQueue<Action> commands = new();
-        private readonly object commandGate = new();
+        private readonly Lock commandGate = new();
         private readonly Dictionary<ulong, PtyIoContext> activeContexts = new();
         private readonly Dictionary<ulong, PtyProcessState> activeProcesses = new();
         private readonly HashSet<PtyIoContext> contexts = new();
@@ -104,6 +104,10 @@ namespace Porta.Pty.Linux
             var completion = CreateCompletionSource();
             this.Post(() =>
             {
+                ulong token = 0;
+                bool reactorRegistered = false;
+                bool activeProcessAdded = false;
+                bool processAdded = false;
                 try
                 {
                     if (this.IsStopped)
@@ -111,25 +115,55 @@ namespace Porta.Pty.Linux
                         throw new IOException("The PTY epoll reactor has stopped.", this.fatalError);
                     }
 
-                    ulong token = this.AllocateToken();
-                    int error = pty_reactor_control(
-                        this.epollFd,
-                        ReactorAdd,
-                        process.PidFileDescriptor,
+                    token = this.AllocateToken();
+                    int error = process.RegisterWithReactor(
                         token,
-                        ReactorRead);
+                        pidFd => pty_reactor_control(
+                            this.epollFd,
+                            ReactorAdd,
+                            pidFd,
+                            token,
+                            ReactorRead));
                     if (error != 0)
                     {
                         throw CreateIOException("Registering a pidfd with epoll", error);
                     }
 
-                    process.ActiveToken = token;
+                    reactorRegistered = true;
                     this.activeProcesses.Add(token, process);
-                    this.processes.Add(process);
+                    activeProcessAdded = true;
+                    if (!this.processes.Add(process))
+                    {
+                        throw new InvalidOperationException("The PTY child is already registered.");
+                    }
+
+                    processAdded = true;
                     completion.TrySetResult(null);
                 }
                 catch (Exception exception)
                 {
+                    if (activeProcessAdded)
+                    {
+                        this.activeProcesses.Remove(token);
+                    }
+
+                    if (processAdded)
+                    {
+                        this.processes.Remove(process);
+                    }
+
+                    if (reactorRegistered)
+                    {
+                        process.RollBackReactorRegistration(
+                            token,
+                            pidFd => _ = pty_reactor_control(
+                                this.epollFd,
+                                ReactorDelete,
+                                pidFd,
+                                token,
+                                0));
+                    }
+
                     completion.TrySetException(exception);
                 }
             });
@@ -333,9 +367,9 @@ namespace Porta.Pty.Linux
                         else if (this.activeProcesses.TryGetValue(
                             reactorEvent.Token,
                             out PtyProcessState? process)
-                            && process.ActiveToken == reactorEvent.Token)
+                            && process.HasReactorToken(reactorEvent.Token))
                         {
-                            this.ProcessExitReady(process);
+                            this.ProcessExitReady(process, reactorEvent.Token);
                         }
                     }
                 }
@@ -355,12 +389,21 @@ namespace Porta.Pty.Linux
                     abandonedCommands = commands.ToArray();
                 }
 
-                foreach (PtyIoContext context in this.contexts)
+                PtyIoContext[] failedContexts = new PtyIoContext[this.contexts.Count];
+                this.contexts.CopyTo(failedContexts);
+                PtyProcessState[] failedProcesses = new PtyProcessState[this.processes.Count];
+                this.processes.CopyTo(failedProcesses);
+                this.activeContexts.Clear();
+                this.contexts.Clear();
+                this.activeProcesses.Clear();
+                this.processes.Clear();
+
+                foreach (PtyIoContext context in failedContexts)
                 {
                     context.FailAfterReactorStopped(exception);
                 }
 
-                foreach (PtyProcessState process in this.processes)
+                foreach (PtyProcessState process in failedProcesses)
                 {
                     process.UseFallbackAfterReactorFailure();
                 }
@@ -462,34 +505,25 @@ namespace Porta.Pty.Linux
             }
         }
 
-        private void ProcessExitReady(PtyProcessState process)
+        private void ProcessExitReady(PtyProcessState process, ulong token)
         {
             if (!process.TryReap(out int exitCode, out Exception? failure))
             {
                 return;
             }
 
-            this.DeactivateProcess(process);
-            process.CompleteReaping(exitCode, failure);
-        }
-
-        private void DeactivateProcess(PtyProcessState process)
-        {
-            ulong token = process.ActiveToken;
-            if (token != 0)
-            {
-                _ = pty_reactor_control(
+            failure = process.DetachAfterReapingFromReactor(
+                token,
+                pidFd => _ = pty_reactor_control(
                     this.epollFd,
                     ReactorDelete,
-                    process.PidFileDescriptor,
+                    pidFd,
                     token,
-                    0);
-                this.activeProcesses.Remove(token);
-                process.ActiveToken = 0;
-            }
-
+                    0),
+                failure);
+            this.activeProcesses.Remove(token);
             this.processes.Remove(process);
-            process.ClosePidFileDescriptor();
+            process.CompleteReaping(exitCode, failure);
         }
 
         private ulong AllocateToken()

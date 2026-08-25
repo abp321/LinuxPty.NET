@@ -13,24 +13,42 @@ namespace Porta.Pty.Linux
     /// </summary>
     internal sealed class PtySpawnQueue
     {
-        private static readonly Lazy<PtySpawnQueue> LazyShared = new(
-            static () => new PtySpawnQueue(),
-            LazyThreadSafetyMode.ExecutionAndPublication);
+        private static readonly Lock SharedGate = new();
+        private static PtySpawnQueue? shared;
 
         private readonly ConcurrentQueue<SpawnRequest> requests = new();
-        private readonly AutoResetEvent wakeEvent = new(false);
+        private readonly AutoResetEvent wakeEvent;
+        private readonly Thread thread;
 
         private PtySpawnQueue()
         {
-            var thread = new Thread(this.Run)
+            this.wakeEvent = new AutoResetEvent(false);
+            try
             {
-                IsBackground = true,
-                Name = "LinuxPty.NET process spawn worker",
-            };
-            thread.Start();
+                this.thread = new Thread(this.Run)
+                {
+                    IsBackground = true,
+                    Name = "LinuxPty.NET process spawn worker",
+                };
+                this.thread.Start();
+            }
+            catch
+            {
+                this.wakeEvent.Dispose();
+                throw;
+            }
         }
 
-        internal static PtySpawnQueue Shared => LazyShared.Value;
+        internal static PtySpawnQueue Shared
+        {
+            get
+            {
+                lock (SharedGate)
+                {
+                    return shared ??= new PtySpawnQueue();
+                }
+            }
+        }
 
         internal Task<IPtyConnection> Enqueue(
             PtyOptions options,
@@ -57,7 +75,7 @@ namespace Porta.Pty.Linux
 
         private sealed class SpawnRequest
         {
-            private readonly object gate = new();
+            private readonly Lock gate = new();
             private readonly PtyOptions options;
             private readonly CancellationToken cancellationToken;
             private readonly TaskCompletionSource<IPtyConnection> completion = new(

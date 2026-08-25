@@ -27,8 +27,8 @@ namespace Porta.Pty.Linux
         private readonly EpollReactor reactor;
         private readonly LinkedList<ReadOperation> reads = new();
         private readonly LinkedList<WriteOperation> writes = new();
-        private readonly object stoppedReactorGate = new();
-        private readonly object stopGate = new();
+        private readonly Lock stoppedReactorGate = new();
+        private readonly Lock stopGate = new();
         private int accepting = 1;
         private int readCloseRequested;
         private int writeCloseRequested;
@@ -685,7 +685,7 @@ namespace Porta.Pty.Linux
 
         private abstract class IoOperation
         {
-            private readonly object completionGate = new();
+            private readonly Lock completionGate = new();
             private CancellationTokenRegistration cancellationRegistration;
             private bool cancellationRegistrationAssigned;
             private bool completed;

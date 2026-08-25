@@ -6,8 +6,9 @@ namespace Porta.Pty.Linux
     using System;
     using System.Collections.Generic;
     using System.Runtime.InteropServices;
+    using System.Runtime.InteropServices.Marshalling;
 
-    internal static class NativeMethods
+    internal static partial class NativeMethods
     {
         internal const int SIGHUP = 1;
         internal const int SIGKILL = 9;
@@ -161,6 +162,8 @@ namespace Porta.Pty.Linux
             }
         }
 
+        // The source-generated marshaller cannot preserve null-terminated UTF-8
+        // char** argv/envp plus PtyTermios's inline c_cc array without custom marshalling.
         [DllImport(LibPortaPty, SetLastError = true)]
         internal static extern PtySpawnResult pty_spawn(
             [MarshalAs(UnmanagedType.LPStr)] string file,
@@ -170,63 +173,63 @@ namespace Porta.Pty.Linux
             ref PtyTermios termios,
             ref PtyWinSize winsize);
 
-        [DllImport(LibPortaPty, SetLastError = true)]
-        internal static extern int pty_resize(int masterFd, ushort rows, ushort cols);
+        [LibraryImport(LibPortaPty, SetLastError = true)]
+        internal static partial int pty_resize(int masterFd, ushort rows, ushort cols);
 
-        [DllImport(LibPortaPty, SetLastError = true)]
-        internal static extern int pty_kill(int pid, int signal);
+        [LibraryImport(LibPortaPty, SetLastError = true)]
+        internal static partial int pty_kill(int pid, int signal);
 
-        [DllImport(LibPortaPty, SetLastError = true)]
-        internal static extern int pty_waitpid(int pid, ref int status, int options);
+        [LibraryImport(LibPortaPty, SetLastError = true)]
+        internal static partial int pty_waitpid(int pid, ref int status, int options);
 
-        [DllImport(LibPortaPty, SetLastError = true)]
-        internal static extern int pty_pidfd_open(int pid);
+        [LibraryImport(LibPortaPty, SetLastError = true)]
+        internal static partial int pty_pidfd_open(int pid);
 
-        [DllImport(LibPortaPty, SetLastError = true)]
-        internal static extern int pty_pidfd_send_signal(int pidFd, int signal);
+        [LibraryImport(LibPortaPty, SetLastError = true)]
+        internal static partial int pty_pidfd_send_signal(int pidFd, int signal);
 
-        [DllImport(LibPortaPty, SetLastError = true)]
-        internal static extern int pty_close(int masterFd);
+        [LibraryImport(LibPortaPty, SetLastError = true)]
+        internal static partial int pty_close(int masterFd);
 
-        [DllImport(LibPortaPty)]
-        internal static extern int pty_configure_master(int masterFd);
+        [LibraryImport(LibPortaPty)]
+        internal static partial int pty_configure_master(int masterFd);
 
-        [DllImport(LibPortaPty)]
-        internal static extern int pty_reactor_create(
+        [LibraryImport(LibPortaPty)]
+        internal static partial int pty_reactor_create(
             ulong wakeToken,
             out int epollFd,
             out int wakeFd);
 
-        [DllImport(LibPortaPty)]
-        internal static extern int pty_reactor_control(
+        [LibraryImport(LibPortaPty)]
+        internal static partial int pty_reactor_control(
             int epollFd,
             int operation,
             int monitoredFd,
             ulong token,
             uint interests);
 
-        [DllImport(LibPortaPty)]
-        internal static extern int pty_reactor_wait(
+        [LibraryImport(LibPortaPty)]
+        internal static partial int pty_reactor_wait(
             int epollFd,
-            [Out] PtyReactorEvent[] events,
+            [Out, MarshalUsing(CountElementName = nameof(capacity))] PtyReactorEvent[] events,
             int capacity,
             out int count);
 
-        [DllImport(LibPortaPty)]
-        internal static extern int pty_reactor_wake(int wakeFd);
+        [LibraryImport(LibPortaPty)]
+        internal static partial int pty_reactor_wake(int wakeFd);
 
-        [DllImport(LibPortaPty)]
-        internal static extern int pty_reactor_drain(int wakeFd);
+        [LibraryImport(LibPortaPty)]
+        internal static partial int pty_reactor_drain(int wakeFd);
 
-        [DllImport(LibPortaPty)]
-        internal static extern int pty_io_read(
+        [LibraryImport(LibPortaPty)]
+        internal static partial int pty_io_read(
             int masterFd,
             IntPtr buffer,
             int length,
             out int transferred);
 
-        [DllImport(LibPortaPty)]
-        internal static extern int pty_io_write(
+        [LibraryImport(LibPortaPty)]
+        internal static partial int pty_io_write(
             int masterFd,
             IntPtr buffer,
             int length,

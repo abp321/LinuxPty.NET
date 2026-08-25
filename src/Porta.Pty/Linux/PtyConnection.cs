@@ -23,8 +23,8 @@ namespace Porta.Pty.Linux
         private readonly PtyProcessState processState;
         private readonly PtyStream readerStream;
         private readonly PtyStream writerStream;
-        private readonly object lifetimeGate = new();
-        private readonly object exitEventGate = new();
+        private readonly Lock lifetimeGate = new();
+        private readonly Lock exitEventGate = new();
         private EventHandler<PtyExitedEventArgs>? processExited;
         private bool exitEventRaised;
         private int masterClosed;
@@ -50,22 +50,9 @@ namespace Porta.Pty.Linux
         {
             add
             {
-                Delegate[]? handlers = null;
                 lock (this.exitEventGate)
                 {
                     this.processExited += value;
-                    if (this.processState.ExitTask.IsCompletedSuccessfully
-                        && this.processExited is not null
-                        && !this.exitEventRaised)
-                    {
-                        this.exitEventRaised = true;
-                        handlers = this.processExited.GetInvocationList();
-                    }
-                }
-
-                if (handlers is not null)
-                {
-                    this.InvokeExitHandlers(handlers, this.processState.ExitCode);
                 }
             }
 
@@ -140,9 +127,10 @@ namespace Porta.Pty.Linux
         public bool WaitForExit(int milliseconds)
         {
             ArgumentOutOfRangeException.ThrowIfLessThan(milliseconds, -1);
-            if (this.processState.ExitTask.IsCompleted)
+            Task<int> exitTask = this.processState.ExitTask;
+            if (exitTask.IsCompleted)
             {
-                _ = this.processState.ExitTask.GetAwaiter().GetResult();
+                _ = exitTask.GetAwaiter().GetResult();
                 return true;
             }
 
@@ -153,19 +141,25 @@ namespace Porta.Pty.Linux
 
             if (milliseconds == -1)
             {
-                _ = this.WaitForExitAsync().AsTask().GetAwaiter().GetResult();
+                _ = exitTask.GetAwaiter().GetResult();
                 return true;
             }
 
             using var timeout = new CancellationTokenSource(milliseconds);
             try
             {
-                _ = this.WaitForExitAsync(timeout.Token).AsTask().GetAwaiter().GetResult();
+                _ = exitTask.WaitAsync(timeout.Token).GetAwaiter().GetResult();
                 return true;
             }
             catch (OperationCanceledException) when (timeout.IsCancellationRequested)
             {
-                return this.processState.ExitTask.IsCompleted;
+                if (!exitTask.IsCompleted)
+                {
+                    return false;
+                }
+
+                _ = exitTask.GetAwaiter().GetResult();
+                return true;
             }
         }
 
@@ -225,11 +219,13 @@ namespace Porta.Pty.Linux
             Delegate[]? handlers = null;
             lock (this.exitEventGate)
             {
-                if (!this.exitEventRaised && this.processExited is not null)
+                if (this.exitEventRaised)
                 {
-                    this.exitEventRaised = true;
-                    handlers = this.processExited.GetInvocationList();
+                    return;
                 }
+
+                this.exitEventRaised = true;
+                handlers = this.processExited?.GetInvocationList();
             }
 
             if (handlers is not null)

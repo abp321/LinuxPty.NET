@@ -13,34 +13,63 @@ namespace Porta.Pty.Linux
     internal sealed class PtyProcessReaper
     {
         private const int PollIntervalMilliseconds = 20;
-        private static readonly Lazy<PtyProcessReaper> LazyShared = new(
-            static () => new PtyProcessReaper(),
-            LazyThreadSafetyMode.ExecutionAndPublication);
+        private static readonly Lock SharedGate = new();
+        private static PtyProcessReaper? shared;
 
-        private readonly object gate = new();
+        private readonly Lock gate = new();
         private readonly HashSet<PtyProcessState> processes = new();
-        private readonly AutoResetEvent wakeEvent = new(false);
+        private readonly AutoResetEvent wakeEvent;
+        private readonly Thread thread;
 
         private PtyProcessReaper()
         {
-            var thread = new Thread(this.Run)
+            this.wakeEvent = new AutoResetEvent(false);
+            try
             {
-                IsBackground = true,
-                Name = "LinuxPty.NET process reaper",
-            };
-            thread.Start();
+                this.thread = new Thread(this.Run)
+                {
+                    IsBackground = true,
+                    Name = "LinuxPty.NET process reaper",
+                };
+                this.thread.Start();
+            }
+            catch
+            {
+                this.wakeEvent.Dispose();
+                throw;
+            }
         }
 
-        internal static PtyProcessReaper Shared => LazyShared.Value;
+        internal static PtyProcessReaper Shared
+        {
+            get
+            {
+                lock (SharedGate)
+                {
+                    return shared ??= new PtyProcessReaper();
+                }
+            }
+        }
 
         internal void Register(PtyProcessState process)
         {
             lock (this.gate)
             {
-                this.processes.Add(process);
-            }
+                if (!this.processes.Add(process))
+                {
+                    throw new InvalidOperationException("The PTY child is already registered.");
+                }
 
-            this.wakeEvent.Set();
+                try
+                {
+                    this.wakeEvent.Set();
+                }
+                catch
+                {
+                    this.processes.Remove(process);
+                    throw;
+                }
+            }
         }
 
         private void Run()
@@ -66,8 +95,7 @@ namespace Porta.Pty.Linux
                         this.processes.Remove(process);
                     }
 
-                    process.ClosePidFileDescriptor();
-                    process.CompleteReaping(exitCode, failure);
+                    process.FinishReapingFromFallback(exitCode, failure);
                 }
 
                 this.wakeEvent.WaitOne(

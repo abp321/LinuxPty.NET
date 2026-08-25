@@ -133,7 +133,14 @@ namespace Porta.Pty.Linux
                     masterClosed = true;
                     try
                     {
-                        await processState.ExitTask.ConfigureAwait(false);
+                        if (processState.HasReapingOwner)
+                        {
+                            await processState.ExitTask.ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            processState.ReapSynchronouslyAfterTrackingFailure();
+                        }
                     }
                     catch
                     {
