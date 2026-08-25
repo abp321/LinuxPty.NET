@@ -16,7 +16,6 @@ namespace Porta.Pty.Linux
     internal sealed class PtyProcessState
     {
         private readonly int pid;
-        private readonly EpollReactor reactor;
         private readonly Lock reapGate = new();
         private readonly TaskCompletionSource<int> exitCompletion = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
@@ -35,7 +34,6 @@ namespace Porta.Pty.Linux
 
             this.pid = pid;
             this.pidFileDescriptor = pidFileDescriptor;
-            this.reactor = EpollReactor.Shared;
         }
 
         private enum LifetimeState
@@ -93,7 +91,7 @@ namespace Porta.Pty.Linux
 
                 try
                 {
-                    await this.reactor.RegisterProcessAsync(this).ConfigureAwait(false);
+                    await EpollReactor.Shared.RegisterProcessAsync(this).ConfigureAwait(false);
                     return;
                 }
                 catch
@@ -183,10 +181,11 @@ namespace Porta.Pty.Linux
             }
             catch
             {
-                // A failed process-wide reaper cannot leave an unowned child. The
-                // reactor thread performs the exceptional blocking cleanup itself.
+                // A failed process-wide reaper cannot leave an unowned child. Claim it
+                // and hand the blocking wait to the spawn worker instead of blocking
+                // the dying reactor thread.
                 _ = this.SendSignal(SIGKILL);
-                this.ReapSynchronouslyAfterTrackingFailure();
+                _ = this.EnsureReapedAsync();
             }
         }
 
@@ -288,14 +287,14 @@ namespace Porta.Pty.Linux
             }
         }
 
-        internal void ReapSynchronouslyAfterTrackingFailure()
+        internal Task EnsureReapedAsync()
         {
             int pidFd;
             lock (this.reapGate)
             {
                 if (this.lifetimeState != LifetimeState.Unowned)
                 {
-                    return;
+                    return this.exitCompletion.Task;
                 }
 
                 // Claim reaping only after every signal operation that was already
@@ -304,6 +303,22 @@ namespace Porta.Pty.Linux
                 pidFd = this.pidFileDescriptor;
             }
 
+            try
+            {
+                PtySpawnQueue.Shared.Post(() => this.ReapClaimedChild(pidFd));
+            }
+            catch
+            {
+                // A claimed child may never be stranded unreaped. If the process-wide
+                // worker is unavailable, reap on the caller's thread instead.
+                this.ReapClaimedChild(pidFd);
+            }
+
+            return this.exitCompletion.Task;
+        }
+
+        private void ReapClaimedChild(int pidFd)
+        {
             PtyWaitResult result = pty_wait_child(this.pid, pidFd, nonBlocking: 0);
 
             int exitCode = 0;

@@ -9,14 +9,14 @@ namespace Porta.Pty.Linux
     using System.Threading.Tasks;
 
     /// <summary>
-    /// Serializes forkpty calls on one dedicated process-wide worker.
+    /// Serializes forkpty calls and emergency reaping work on one dedicated process-wide worker.
     /// </summary>
     internal sealed class PtySpawnQueue
     {
         private static readonly Lock SharedGate = new();
         private static PtySpawnQueue? shared;
 
-        private readonly ConcurrentQueue<SpawnRequest> requests = new();
+        private readonly ConcurrentQueue<Action> workItems = new();
         private readonly AutoResetEvent wakeEvent;
         private readonly Thread thread;
 
@@ -55,18 +55,30 @@ namespace Porta.Pty.Linux
             CancellationToken cancellationToken)
         {
             var request = new SpawnRequest(options, cancellationToken);
-            this.requests.Enqueue(request);
-            this.wakeEvent.Set();
+            this.Post(request.Execute);
             return request.Task;
+        }
+
+        internal void Post(Action workItem)
+        {
+            this.workItems.Enqueue(workItem);
+            this.wakeEvent.Set();
         }
 
         private void Run()
         {
             for (;;)
             {
-                while (this.requests.TryDequeue(out SpawnRequest? request))
+                while (this.workItems.TryDequeue(out Action? workItem))
                 {
-                    request.Execute();
+                    try
+                    {
+                        workItem();
+                    }
+                    catch
+                    {
+                        // The process-wide worker must outlive any single work item.
+                    }
                 }
 
                 this.wakeEvent.WaitOne();

@@ -50,12 +50,6 @@ namespace Porta.Pty.Linux
                     + $"({GetErrorMessage(result.Error)}), masterFd={result.MasterFd}, pid={result.Pid}");
             }
 
-            if (cancellationToken.IsCancellationRequested)
-            {
-                CleanupUntrackedChild(result.MasterFd, result.Pid, result.PidFd);
-                throw new OperationCanceledException(cancellationToken);
-            }
-
             PtyProcessState? processState = null;
             PtyIoContext? ioContext = null;
             try
@@ -194,8 +188,7 @@ namespace Porta.Pty.Linux
             TryClose(masterFd);
             try
             {
-                processState.ReapSynchronouslyAfterTrackingFailure();
-                await processState.ExitTask.ConfigureAwait(false);
+                await processState.EnsureReapedAsync().ConfigureAwait(false);
             }
             catch
             {
