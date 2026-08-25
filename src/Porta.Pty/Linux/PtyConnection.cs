@@ -4,10 +4,10 @@
 namespace Porta.Pty.Linux
 {
     using System;
-    using System.Diagnostics;
     using System.IO;
     using System.Runtime.InteropServices;
     using System.Threading;
+    using System.Threading.Tasks;
     using static Porta.Pty.Linux.NativeMethods;
 
     /// <summary>
@@ -15,38 +15,68 @@ namespace Porta.Pty.Linux
     /// </summary>
     internal sealed class PtyConnection : IPtyConnection
     {
-        private const int EINTR = 4;
         private const int ESRCH = 3;
 
         private readonly int controller;
         private readonly int pid;
         private readonly PtyIoContext ioContext;
+        private readonly PtyProcessState processState;
         private readonly PtyStream readerStream;
         private readonly PtyStream writerStream;
         private readonly object lifetimeGate = new();
-        private readonly ManualResetEvent terminalProcessTerminatedEvent = new ManualResetEvent(false);
-        private int exitCode;
+        private readonly object exitEventGate = new();
+        private EventHandler<PtyExitedEventArgs>? processExited;
+        private bool exitEventRaised;
+        private int masterClosed;
         private bool isDisposed;
+        private Task? disposalTask;
 
-        public PtyConnection(int controller, int pid, PtyIoContext ioContext)
+        internal PtyConnection(
+            int controller,
+            int pid,
+            PtyIoContext ioContext,
+            PtyProcessState processState)
         {
             this.controller = controller;
             this.pid = pid;
             this.ioContext = ioContext;
+            this.processState = processState;
             this.readerStream = new PtyStream(ioContext, FileAccess.Read);
             this.writerStream = new PtyStream(ioContext, FileAccess.Write);
-
-            var childWatcherThread = new Thread(this.ChildWatcherThreadProc)
-            {
-                IsBackground = true,
-                Priority = ThreadPriority.Lowest,
-                Name = $"Watcher thread for child process {pid}",
-            };
-
-            childWatcherThread.Start();
+            _ = this.ObserveProcessExitAsync();
         }
 
-        public event EventHandler<PtyExitedEventArgs>? ProcessExited;
+        public event EventHandler<PtyExitedEventArgs>? ProcessExited
+        {
+            add
+            {
+                Delegate[]? handlers = null;
+                lock (this.exitEventGate)
+                {
+                    this.processExited += value;
+                    if (this.processState.ExitTask.IsCompletedSuccessfully
+                        && this.processExited is not null
+                        && !this.exitEventRaised)
+                    {
+                        this.exitEventRaised = true;
+                        handlers = this.processExited.GetInvocationList();
+                    }
+                }
+
+                if (handlers is not null)
+                {
+                    this.InvokeExitHandlers(handlers, this.processState.ExitCode);
+                }
+            }
+
+            remove
+            {
+                lock (this.exitEventGate)
+                {
+                    this.processExited -= value;
+                }
+            }
+        }
 
         public Stream ReaderStream => this.readerStream;
 
@@ -54,26 +84,27 @@ namespace Porta.Pty.Linux
 
         public int Pid => this.pid;
 
-        public int ExitCode => this.exitCode;
+        public int ExitCode => this.processState.ExitCode;
 
         public void Dispose()
         {
+            this.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+
+        public ValueTask DisposeAsync()
+        {
             lock (this.lifetimeGate)
             {
-                if (this.isDisposed)
+                if (this.disposalTask is not null)
                 {
-                    return;
+                    return new ValueTask(this.disposalTask);
                 }
 
                 this.isDisposed = true;
                 this.readerStream.MarkDisposedByConnection();
                 this.writerStream.MarkDisposedByConnection();
-
-                // Retirement is acknowledged before close, so the reactor can no longer
-                // issue a syscall against a descriptor that Linux may immediately reuse.
-                this.ioContext.Stop();
-                this.TryKill();
-                this.TryClose();
+                this.disposalTask = this.DisposeCoreAsync();
+                return new ValueTask(this.disposalTask);
             }
         }
 
@@ -82,12 +113,12 @@ namespace Porta.Pty.Linux
             lock (this.lifetimeGate)
             {
                 ObjectDisposedException.ThrowIf(this.isDisposed, this);
-                if (pty_kill(this.pid, SIGHUP) == -1)
+                int error = this.processState.SendSignal(SIGHUP);
+                if (error != 0)
                 {
-                    int errno = Marshal.GetLastWin32Error();
-                    if (errno != ESRCH)
+                    if (error != ESRCH)
                     {
-                        throw new InvalidOperationException($"Killing terminal failed with error {errno}");
+                        throw new InvalidOperationException($"Killing terminal failed with error {error}");
                     }
                 }
             }
@@ -108,15 +139,127 @@ namespace Porta.Pty.Linux
 
         public bool WaitForExit(int milliseconds)
         {
-            return this.terminalProcessTerminatedEvent.WaitOne(milliseconds);
+            ArgumentOutOfRangeException.ThrowIfLessThan(milliseconds, -1);
+            if (this.processState.ExitTask.IsCompleted)
+            {
+                _ = this.processState.ExitTask.GetAwaiter().GetResult();
+                return true;
+            }
+
+            if (milliseconds == 0)
+            {
+                return false;
+            }
+
+            if (milliseconds == -1)
+            {
+                _ = this.WaitForExitAsync().AsTask().GetAwaiter().GetResult();
+                return true;
+            }
+
+            using var timeout = new CancellationTokenSource(milliseconds);
+            try
+            {
+                _ = this.WaitForExitAsync(timeout.Token).AsTask().GetAwaiter().GetResult();
+                return true;
+            }
+            catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+            {
+                return this.processState.ExitTask.IsCompleted;
+            }
         }
 
-        private void TryKill()
+        public ValueTask<int> WaitForExitAsync(CancellationToken cancellationToken = default)
+        {
+            Task<int> exitTask = this.processState.ExitTask;
+            if (!cancellationToken.CanBeCanceled || exitTask.IsCompleted)
+            {
+                return new ValueTask<int>(exitTask);
+            }
+
+            return new ValueTask<int>(exitTask.WaitAsync(cancellationToken));
+        }
+
+        private async Task DisposeCoreAsync()
+        {
+            this.TryKill(SIGHUP);
+            try
+            {
+                await this.ioContext.StopAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                this.TryCloseMaster();
+            }
+
+            if (!this.processState.IsExited)
+            {
+                // SIGHUP preserves the historical cleanup behavior; SIGKILL ensures an
+                // ignored HUP cannot leave async disposal waiting forever.
+                this.TryKill(SIGKILL);
+            }
+
+            try
+            {
+                await this.processState.ExitTask.ConfigureAwait(false);
+            }
+            catch
+            {
+                // The descriptor is retired and closed even if an external SIGCHLD
+                // policy made the child's exit status unavailable.
+            }
+        }
+
+        private async Task ObserveProcessExitAsync()
+        {
+            int processExitCode;
+            try
+            {
+                processExitCode = await this.processState.ExitTask.ConfigureAwait(false);
+            }
+            catch
+            {
+                return;
+            }
+
+            Delegate[]? handlers = null;
+            lock (this.exitEventGate)
+            {
+                if (!this.exitEventRaised && this.processExited is not null)
+                {
+                    this.exitEventRaised = true;
+                    handlers = this.processExited.GetInvocationList();
+                }
+            }
+
+            if (handlers is not null)
+            {
+                this.InvokeExitHandlers(handlers, processExitCode);
+            }
+        }
+
+        private void InvokeExitHandlers(Delegate[] handlers, int processExitCode)
+        {
+            var eventArgs = new PtyExitedEventArgs(processExitCode);
+            foreach (Delegate handler in handlers)
+            {
+                try
+                {
+                    ((EventHandler<PtyExitedEventArgs>)handler)(this, eventArgs);
+                }
+                catch
+                {
+                    // A subscriber must not stop the process-wide reactor or reaper.
+                }
+            }
+        }
+
+        private void TryKill(int signal)
         {
             try
             {
-                if (pty_kill(this.pid, SIGHUP) == -1
-                    && Marshal.GetLastWin32Error() != ESRCH)
+                int error = this.processState.SendSignal(signal);
+                if (error != 0 && error != ESRCH)
                 {
                     throw new InvalidOperationException("Killing terminal failed during cleanup.");
                 }
@@ -127,42 +270,22 @@ namespace Porta.Pty.Linux
             }
         }
 
-        private void TryClose()
+        private void TryCloseMaster()
         {
+            if (Interlocked.Exchange(ref this.masterClosed, 1) != 0)
+            {
+                return;
+            }
+
             try
             {
-                pty_close(this.controller);
+                // Never retry close after EINTR because Linux may already have reused the fd.
+                _ = pty_close(this.controller);
             }
             catch
             {
                 // Cleanup must not throw.
             }
-        }
-
-        private void ChildWatcherThreadProc()
-        {
-            Debug.WriteLine($"Waiting on {this.pid}");
-            const int SignalMask = 127;
-            const int ExitCodeMask = 255;
-
-            int status = 0;
-            if (pty_waitpid(this.pid, ref status, 0) == -1)
-            {
-                int errno = Marshal.GetLastWin32Error();
-                Debug.WriteLine($"Wait failed with {errno}");
-                if (errno == EINTR)
-                {
-                    this.ChildWatcherThreadProc();
-                }
-
-                return;
-            }
-
-            Debug.WriteLine("Wait succeeded");
-            int exitSignal = status & SignalMask;
-            this.exitCode = exitSignal == 0 ? (status >> 8) & ExitCodeMask : 0;
-            this.terminalProcessTerminatedEvent.Set();
-            this.ProcessExited?.Invoke(this, new PtyExitedEventArgs(this.exitCode));
         }
     }
 }

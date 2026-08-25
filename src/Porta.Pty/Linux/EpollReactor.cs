@@ -30,7 +30,9 @@ namespace Porta.Pty.Linux
         private readonly ConcurrentQueue<Action> commands = new();
         private readonly object commandGate = new();
         private readonly Dictionary<ulong, PtyIoContext> activeContexts = new();
+        private readonly Dictionary<ulong, PtyProcessState> activeProcesses = new();
         private readonly HashSet<PtyIoContext> contexts = new();
+        private readonly HashSet<PtyProcessState> processes = new();
         private readonly PtyReactorEvent[] events = new PtyReactorEvent[EventCapacity];
         private readonly Thread thread;
         private long nextToken;
@@ -73,7 +75,7 @@ namespace Porta.Pty.Linux
             }
         }
 
-        internal void Register(PtyIoContext context)
+        internal Task RegisterAsync(PtyIoContext context)
         {
             var completion = CreateCompletionSource();
             this.Post(() =>
@@ -85,29 +87,6 @@ namespace Porta.Pty.Linux
                         throw new IOException("The PTY epoll reactor has stopped.", this.fatalError);
                     }
 
-                    ulong probeToken = this.AllocateToken();
-                    int error = pty_reactor_control(
-                        this.epollFd,
-                        ReactorAdd,
-                        context.FileDescriptor,
-                        probeToken,
-                        ReactorRead);
-                    if (error != 0)
-                    {
-                        throw CreateIOException("Registering a PTY descriptor with epoll", error);
-                    }
-
-                    error = pty_reactor_control(
-                        this.epollFd,
-                        ReactorDelete,
-                        context.FileDescriptor,
-                        probeToken,
-                        0);
-                    if (error != 0)
-                    {
-                        throw CreateIOException("Deregistering a PTY descriptor from epoll", error);
-                    }
-
                     this.contexts.Add(context);
                     completion.TrySetResult(null);
                 }
@@ -117,7 +96,45 @@ namespace Porta.Pty.Linux
                 }
             });
 
-            completion.Task.GetAwaiter().GetResult();
+            return completion.Task;
+        }
+
+        internal Task RegisterProcessAsync(PtyProcessState process)
+        {
+            var completion = CreateCompletionSource();
+            this.Post(() =>
+            {
+                try
+                {
+                    if (this.IsStopped)
+                    {
+                        throw new IOException("The PTY epoll reactor has stopped.", this.fatalError);
+                    }
+
+                    ulong token = this.AllocateToken();
+                    int error = pty_reactor_control(
+                        this.epollFd,
+                        ReactorAdd,
+                        process.PidFileDescriptor,
+                        token,
+                        ReactorRead);
+                    if (error != 0)
+                    {
+                        throw CreateIOException("Registering a pidfd with epoll", error);
+                    }
+
+                    process.ActiveToken = token;
+                    this.activeProcesses.Add(token, process);
+                    this.processes.Add(process);
+                    completion.TrySetResult(null);
+                }
+                catch (Exception exception)
+                {
+                    completion.TrySetException(exception);
+                }
+            });
+
+            return completion.Task;
         }
 
         internal void PostContextCommand(PtyIoContext context, Action action)
@@ -143,7 +160,7 @@ namespace Porta.Pty.Linux
             return completion.Task;
         }
 
-        internal void Stop(PtyIoContext context)
+        internal Task StopAsync(PtyIoContext context)
         {
             var completion = CreateCompletionSource();
             try
@@ -161,13 +178,14 @@ namespace Porta.Pty.Linux
                         completion.TrySetResult(null);
                     }
                 });
-
-                completion.Task.GetAwaiter().GetResult();
             }
-            catch (Exception exception) when (this.IsStopped)
+            catch (Exception exception)
             {
                 context.StopAfterReactorFailure(exception);
+                completion.TrySetResult(null);
             }
+
+            return completion.Task;
         }
 
         internal void UpdateInterest(PtyIoContext context, uint desiredInterest)
@@ -312,6 +330,13 @@ namespace Porta.Pty.Linux
                                 context,
                                 () => context.ProcessReadyOnReactor(reactorEvent.Events));
                         }
+                        else if (this.activeProcesses.TryGetValue(
+                            reactorEvent.Token,
+                            out PtyProcessState? process)
+                            && process.ActiveToken == reactorEvent.Token)
+                        {
+                            this.ProcessExitReady(process);
+                        }
                     }
                 }
             }
@@ -335,6 +360,11 @@ namespace Porta.Pty.Linux
                     context.FailAfterReactorStopped(exception);
                 }
 
+                foreach (PtyProcessState process in this.processes)
+                {
+                    process.UseFallbackAfterReactorFailure();
+                }
+
                 foreach (Action command in abandonedCommands)
                 {
                     try
@@ -346,6 +376,11 @@ namespace Porta.Pty.Linux
                         // Contexts have already been failed; no operation may remain pending.
                     }
                 }
+            }
+            finally
+            {
+                _ = pty_close(this.wakeFd);
+                _ = pty_close(this.epollFd);
             }
         }
 
@@ -425,6 +460,36 @@ namespace Porta.Pty.Linux
             {
                 throw CreateIOException("Removing PTY epoll interest", error);
             }
+        }
+
+        private void ProcessExitReady(PtyProcessState process)
+        {
+            if (!process.TryReap(out int exitCode, out Exception? failure))
+            {
+                return;
+            }
+
+            this.DeactivateProcess(process);
+            process.CompleteReaping(exitCode, failure);
+        }
+
+        private void DeactivateProcess(PtyProcessState process)
+        {
+            ulong token = process.ActiveToken;
+            if (token != 0)
+            {
+                _ = pty_reactor_control(
+                    this.epollFd,
+                    ReactorDelete,
+                    process.PidFileDescriptor,
+                    token,
+                    0);
+                this.activeProcesses.Remove(token);
+                process.ActiveToken = 0;
+            }
+
+            this.processes.Remove(process);
+            process.ClosePidFileDescriptor();
         }
 
         private ulong AllocateToken()

@@ -33,9 +33,9 @@ namespace Porta.Pty
         /// </summary>
         /// <param name="options">The options for creating the pseudoterminal.</param>
         /// <param name="cancellationToken">
-        /// Retained for API compatibility. The current synchronous spawn path does not observe cancellation.
+        /// Cancels a queued spawn, or cleans up a process whose native spawn is already in progress.
         /// </param>
-        /// <returns>A completed task containing the spawned connection.</returns>
+        /// <returns>A task containing the spawned connection.</returns>
         public static Task<IPtyConnection> SpawnAsync(
             PtyOptions options,
             CancellationToken cancellationToken)
@@ -65,12 +65,19 @@ namespace Porta.Pty
                 throw new PlatformNotSupportedException("LinuxPty.NET supports Linux only.");
             }
 
-            IDictionary<string, string> environment = MergeEnvironment(LinuxPtyEnvironment, null);
-            environment = MergeEnvironment(options.Environment, environment);
-            options.Environment = environment;
+            var preparedOptions = new PtyOptions
+            {
+                App = options.App,
+                Cwd = options.Cwd,
+                Rows = options.Rows,
+                Cols = options.Cols,
+                CommandLine = (string[])options.CommandLine.Clone(),
+                Environment = MergeEnvironment(
+                    options.Environment,
+                    MergeEnvironment(LinuxPtyEnvironment, null)),
+            };
 
-            _ = cancellationToken;
-            return Task.FromResult<IPtyConnection>(Linux.PtyProvider.StartTerminal(options));
+            return Linux.PtySpawnQueue.Shared.Enqueue(preparedOptions, cancellationToken);
         }
 
         private static IDictionary<string, string> MergeEnvironment(

@@ -21,11 +21,26 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 
 #define PTY_EXPORT __attribute__((visibility("default")))
+
+/*
+ * Linux assigned these syscall numbers consistently on x86-64 and arm64.
+ * Define them when building against the older kernel headers used to preserve
+ * the library's glibc 2.27 runtime floor.
+ */
+#if defined(__x86_64__) || defined(__aarch64__)
+#ifndef SYS_pidfd_send_signal
+#define SYS_pidfd_send_signal 424
+#endif
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#endif
 
 typedef struct {
     unsigned int c_iflag;
@@ -490,6 +505,44 @@ PTY_EXPORT int pty_kill(int pid, int signal_number)
 PTY_EXPORT int pty_waitpid(int pid, int* status, int options)
 {
     return waitpid(pid, status, options);
+}
+
+PTY_EXPORT int pty_pidfd_open(int pid)
+{
+#ifdef SYS_pidfd_open
+    int pid_fd;
+    do {
+        pid_fd = (int)syscall(SYS_pidfd_open, pid, 0);
+    } while (pid_fd == -1 && errno == EINTR);
+
+    return pid_fd;
+#else
+    (void)pid;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+PTY_EXPORT int pty_pidfd_send_signal(int pid_fd, int signal_number)
+{
+#ifdef SYS_pidfd_send_signal
+    int result;
+    do {
+        result = (int)syscall(
+            SYS_pidfd_send_signal,
+            pid_fd,
+            signal_number,
+            NULL,
+            0);
+    } while (result == -1 && errno == EINTR);
+
+    return result;
+#else
+    (void)pid_fd;
+    (void)signal_number;
+    errno = ENOSYS;
+    return -1;
+#endif
 }
 
 PTY_EXPORT int pty_close(int master_fd)

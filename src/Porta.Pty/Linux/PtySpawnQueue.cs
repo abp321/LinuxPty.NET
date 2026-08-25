@@ -1,0 +1,172 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+
+namespace Porta.Pty.Linux
+{
+    using System;
+    using System.Collections.Concurrent;
+    using System.Threading;
+    using System.Threading.Tasks;
+
+    /// <summary>
+    /// Serializes forkpty calls on one dedicated process-wide worker.
+    /// </summary>
+    internal sealed class PtySpawnQueue
+    {
+        private static readonly Lazy<PtySpawnQueue> LazyShared = new(
+            static () => new PtySpawnQueue(),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+
+        private readonly ConcurrentQueue<SpawnRequest> requests = new();
+        private readonly AutoResetEvent wakeEvent = new(false);
+
+        private PtySpawnQueue()
+        {
+            var thread = new Thread(this.Run)
+            {
+                IsBackground = true,
+                Name = "LinuxPty.NET process spawn worker",
+            };
+            thread.Start();
+        }
+
+        internal static PtySpawnQueue Shared => LazyShared.Value;
+
+        internal Task<IPtyConnection> Enqueue(
+            PtyOptions options,
+            CancellationToken cancellationToken)
+        {
+            var request = new SpawnRequest(options, cancellationToken);
+            this.requests.Enqueue(request);
+            this.wakeEvent.Set();
+            return request.Task;
+        }
+
+        private void Run()
+        {
+            for (;;)
+            {
+                while (this.requests.TryDequeue(out SpawnRequest? request))
+                {
+                    request.Execute();
+                }
+
+                this.wakeEvent.WaitOne();
+            }
+        }
+
+        private sealed class SpawnRequest
+        {
+            private readonly object gate = new();
+            private readonly PtyOptions options;
+            private readonly CancellationToken cancellationToken;
+            private readonly TaskCompletionSource<IPtyConnection> completion = new(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            private CancellationTokenRegistration cancellationRegistration;
+            private int state;
+
+            internal SpawnRequest(PtyOptions options, CancellationToken cancellationToken)
+            {
+                this.options = options;
+                this.cancellationToken = cancellationToken;
+                this.cancellationRegistration = cancellationToken.Register(
+                    static request => ((SpawnRequest)request!).CancelQueuedRequest(),
+                    this);
+            }
+
+            internal Task<IPtyConnection> Task => this.completion.Task;
+
+            internal void Execute()
+            {
+                bool skip;
+                lock (this.gate)
+                {
+                    if (this.state != 0)
+                    {
+                        skip = true;
+                    }
+                    else if (this.cancellationToken.IsCancellationRequested)
+                    {
+                        this.state = 2;
+                        this.completion.TrySetCanceled(this.cancellationToken);
+                        skip = true;
+                    }
+                    else
+                    {
+                        this.state = 1;
+                        skip = false;
+                    }
+                }
+
+                if (skip)
+                {
+                    this.cancellationRegistration.Dispose();
+                    return;
+                }
+
+                _ = this.ExecuteAsync();
+            }
+
+            private async Task ExecuteAsync()
+            {
+                try
+                {
+                    IPtyConnection connection = await PtyProvider.StartTerminalAsync(
+                        this.options,
+                        this.cancellationToken).ConfigureAwait(false);
+
+                    bool canceled;
+                    lock (this.gate)
+                    {
+                        canceled = this.cancellationToken.IsCancellationRequested;
+                        this.state = 2;
+                    }
+
+                    if (canceled)
+                    {
+                        await connection.DisposeAsync().ConfigureAwait(false);
+                        this.completion.TrySetCanceled(this.cancellationToken);
+                    }
+                    else
+                    {
+                        this.completion.TrySetResult(connection);
+                    }
+                }
+                catch (Exception exception)
+                {
+                    lock (this.gate)
+                    {
+                        this.state = 2;
+                    }
+
+                    if (this.cancellationToken.IsCancellationRequested)
+                    {
+                        this.completion.TrySetCanceled(this.cancellationToken);
+                    }
+                    else
+                    {
+                        this.completion.TrySetException(exception);
+                    }
+                }
+                finally
+                {
+                    this.cancellationRegistration.Dispose();
+                }
+            }
+
+            private void CancelQueuedRequest()
+            {
+                lock (this.gate)
+                {
+                    if (this.state != 0)
+                    {
+                        return;
+                    }
+
+                    this.state = 2;
+                    this.completion.TrySetCanceled(this.cancellationToken);
+                }
+            }
+        }
+    }
+}

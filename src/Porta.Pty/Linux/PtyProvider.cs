@@ -7,6 +7,8 @@ namespace Porta.Pty.Linux
     using System.Collections.Generic;
     using System.Linq;
     using System.Runtime.InteropServices;
+    using System.Threading;
+    using System.Threading.Tasks;
     using static Porta.Pty.Linux.NativeMethods;
 
     /// <summary>
@@ -14,7 +16,11 @@ namespace Porta.Pty.Linux
     /// </summary>
     internal static class PtyProvider
     {
-        public static IPtyConnection StartTerminal(PtyOptions options)
+        private const int EINTR = 4;
+
+        internal static async Task<IPtyConnection> StartTerminalAsync(
+            PtyOptions options,
+            CancellationToken cancellationToken)
         {
             var terminalSize = new PtyWinSize((ushort)options.Rows, (ushort)options.Cols);
             string?[] terminalArgs = GetExecvpArgs(options);
@@ -59,6 +65,7 @@ namespace Porta.Pty.Linux
                 speed: TermSpeed.B38400,
                 controlCharacters: controlCharacters);
 
+            // This synchronous native call always runs on PtySpawnQueue's dedicated worker.
             PtySpawnResult result = pty_spawn(
                 options.App,
                 terminalArgs,
@@ -69,12 +76,25 @@ namespace Porta.Pty.Linux
 
             if (result.Pid == -1)
             {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException(cancellationToken);
+                }
+
                 throw new InvalidOperationException(
                     $"pty_spawn failed for '{options.App}': error={result.Error} "
                     + $"({GetErrorMessage(result.Error)}), masterFd={result.MasterFd}, pid={result.Pid}");
             }
 
+            if (cancellationToken.IsCancellationRequested)
+            {
+                CleanupUntrackedChild(result.MasterFd, result.Pid);
+                throw new OperationCanceledException(cancellationToken);
+            }
+
+            PtyProcessState? processState = null;
             PtyIoContext? ioContext = null;
+            bool masterClosed = false;
             try
             {
                 int configureError = pty_configure_master(result.MasterFd);
@@ -85,12 +105,52 @@ namespace Porta.Pty.Linux
                         + $"error={configureError} ({GetErrorMessage(configureError)}).");
                 }
 
-                ioContext = PtyIoContext.Create(result.MasterFd);
-                return new PtyConnection(result.MasterFd, result.Pid, ioContext);
+                processState = new PtyProcessState(result.Pid);
+                await processState.StartAsync().ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+
+                ioContext = await PtyIoContext.CreateAsync(result.MasterFd).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+
+                return new PtyConnection(result.MasterFd, result.Pid, ioContext, processState);
             }
             catch
             {
-                CleanupFailedConnection(result.MasterFd, result.Pid, ioContext);
+                if (processState is null)
+                {
+                    CleanupUntrackedChild(result.MasterFd, result.Pid);
+                    masterClosed = true;
+                }
+                else
+                {
+                    _ = processState.SendSignal(SIGKILL);
+                    if (ioContext is not null)
+                    {
+                        await ioContext.StopAsync().ConfigureAwait(false);
+                    }
+
+                    _ = pty_close(result.MasterFd);
+                    masterClosed = true;
+                    try
+                    {
+                        await processState.ExitTask.ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // Cleanup must not replace the setup exception.
+                    }
+                }
+
+                if (!masterClosed)
+                {
+                    _ = pty_close(result.MasterFd);
+                }
+
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException(cancellationToken);
+                }
+
                 throw;
             }
         }
@@ -118,50 +178,27 @@ namespace Porta.Pty.Linux
             return new System.ComponentModel.Win32Exception(errno).Message;
         }
 
-        private static void CleanupFailedConnection(
-            int masterFd,
-            int pid,
-            PtyIoContext? ioContext)
+        private static void CleanupUntrackedChild(int masterFd, int pid)
+        {
+            TryKill(pid, SIGKILL);
+            _ = pty_close(masterFd);
+
+            int status = 0;
+            while (pty_waitpid(pid, ref status, 0) == -1
+                && Marshal.GetLastWin32Error() == EINTR)
+            {
+            }
+        }
+
+        private static void TryKill(int pid, int signal)
         {
             try
             {
-                ioContext?.Stop();
+                _ = pty_kill(pid, signal);
             }
             catch
             {
-                // The setup exception remains the useful failure.
-            }
-
-            try
-            {
-                pty_kill(pid, SIGKILL);
-            }
-            catch
-            {
-                // Continue with descriptor cleanup and reaping.
-            }
-
-            try
-            {
-                // Never retry close after EINTR because Linux may already have reused the fd.
-                pty_close(masterFd);
-            }
-            catch
-            {
-                // Continue reaping the child.
-            }
-
-            try
-            {
-                int status = 0;
-                while (pty_waitpid(pid, ref status, 0) == -1
-                    && Marshal.GetLastWin32Error() == 4)
-                {
-                }
-            }
-            catch
-            {
-                // Cleanup must not replace the original setup exception.
+                // Continue closing and reaping the child.
             }
         }
     }

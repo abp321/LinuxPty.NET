@@ -11,6 +11,7 @@ namespace Porta.Pty.Linux
     {
         internal const int SIGHUP = 1;
         internal const int SIGKILL = 9;
+        internal const int WaitNoHang = 1;
 
         internal const int ReactorAdd = 1;
         internal const int ReactorModify = 2;
@@ -177,6 +178,12 @@ namespace Porta.Pty.Linux
 
         [DllImport(LibPortaPty, SetLastError = true)]
         internal static extern int pty_waitpid(int pid, ref int status, int options);
+
+        [DllImport(LibPortaPty, SetLastError = true)]
+        internal static extern int pty_pidfd_open(int pid);
+
+        [DllImport(LibPortaPty, SetLastError = true)]
+        internal static extern int pty_pidfd_send_signal(int pidFd, int signal);
 
         [DllImport(LibPortaPty, SetLastError = true)]
         internal static extern int pty_close(int masterFd);

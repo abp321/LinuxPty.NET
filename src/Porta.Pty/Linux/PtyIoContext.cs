@@ -28,6 +28,7 @@ namespace Porta.Pty.Linux
         private readonly LinkedList<ReadOperation> reads = new();
         private readonly LinkedList<WriteOperation> writes = new();
         private readonly object stoppedReactorGate = new();
+        private readonly object stopGate = new();
         private int accepting = 1;
         private int readCloseRequested;
         private int writeCloseRequested;
@@ -40,6 +41,7 @@ namespace Porta.Pty.Linux
         private Exception? terminalError;
         private Exception? readError;
         private Exception? writeError;
+        private Task? stopTask;
 
         private PtyIoContext(int fileDescriptor, EpollReactor reactor)
         {
@@ -55,11 +57,11 @@ namespace Porta.Pty.Linux
 
         internal bool IsStoppedOnReactor => this.stoppedOnReactor;
 
-        internal static PtyIoContext Create(int fileDescriptor)
+        internal static async Task<PtyIoContext> CreateAsync(int fileDescriptor)
         {
             EpollReactor reactor = EpollReactor.Shared;
             var context = new PtyIoContext(fileDescriptor, reactor);
-            reactor.Register(context);
+            await reactor.RegisterAsync(context).ConfigureAwait(false);
             return context;
         }
 
@@ -138,15 +140,20 @@ namespace Porta.Pty.Linux
             }
         }
 
-        internal void Stop()
+        internal Task StopAsync()
         {
             Interlocked.Exchange(ref this.accepting, 0);
-            if (Interlocked.Exchange(ref this.stopRequested, 1) != 0)
+            lock (this.stopGate)
             {
-                return;
-            }
+                if (this.stopTask is not null)
+                {
+                    return this.stopTask;
+                }
 
-            this.reactor.Stop(this);
+                Interlocked.Exchange(ref this.stopRequested, 1);
+                this.stopTask = this.reactor.StopAsync(this);
+                return this.stopTask;
+            }
         }
 
         internal void ProcessReadyOnReactor(uint events)

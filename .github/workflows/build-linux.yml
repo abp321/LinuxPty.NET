@@ -93,6 +93,8 @@ jobs:
             pty_io_read
             pty_io_write
             pty_kill
+            pty_pidfd_open
+            pty_pidfd_send_signal
             pty_reactor_control
             pty_reactor_create
             pty_reactor_drain
@@ -280,6 +282,8 @@ jobs:
               pty_io_read
               pty_io_write
               pty_kill
+              pty_pidfd_open
+              pty_pidfd_send_signal
               pty_reactor_control
               pty_reactor_create
               pty_reactor_drain

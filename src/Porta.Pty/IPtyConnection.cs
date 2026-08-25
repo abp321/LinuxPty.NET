@@ -5,11 +5,13 @@ namespace Porta.Pty
 {
     using System;
     using System.IO;
+    using System.Threading;
+    using System.Threading.Tasks;
 
     /// <summary>
     /// Connection to a running pseudoterminal process.
     /// </summary>
-    public interface IPtyConnection : IDisposable
+    public interface IPtyConnection : IDisposable, IAsyncDisposable
     {
         /// <summary>
         /// Event fired when the pty process exits.
@@ -40,8 +42,15 @@ namespace Porta.Pty
         /// Wait for the pty process to exit up to a given timeout.
         /// </summary>
         /// <param name="milliseconds">Timeout to wait for the process to exit.</param>
-        /// <returns>True if the process exists within the timeout, false otherwise.</returns>
+        /// <returns>True if the process exits within the timeout, false otherwise.</returns>
         bool WaitForExit(int milliseconds);
+
+        /// <summary>
+        /// Asynchronously waits for the pty process to exit and be reaped.
+        /// </summary>
+        /// <param name="cancellationToken">Cancels only this wait operation.</param>
+        /// <returns>The pty process exit code.</returns>
+        ValueTask<int> WaitForExitAsync(CancellationToken cancellationToken = default);
 
         /// <summary>
         /// Immediately terminates the pty process.

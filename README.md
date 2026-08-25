@@ -11,7 +11,9 @@ The NuGet package ID is `LinuxPty.NET`. The inherited public API remains in the 
 
 LinuxPty.NET publishes on the `1.0.x` package line. Process spawning, resize, kill, disposal, and environment handling remain based on Porta.Pty.
 
-PTY stream I/O is non-blocking and readiness-driven on Linux. All connections in a process share one epoll reactor and one reactor thread; pending asynchronous reads and writes do not occupy blocked ThreadPool workers. Synchronous `Stream` methods still block their caller by definition. Despite the inherited `SpawnAsync` name, process creation itself remains synchronous and its cancellation token is not observed.
+PTY stream I/O and process-exit observation are non-blocking and readiness-driven on Linux. All connections in a process share one epoll reactor and one reactor thread. The reactor monitors PTY master descriptors and, when the kernel supports them, pidfds. Older kernels use one process-wide fallback reaper rather than one blocked watcher thread per connection.
+
+`SpawnAsync` queues the inherently synchronous `forkpty` call on one dedicated process-wide spawn worker, so it does not block its caller or a ThreadPool worker. Cancellation is observed before queued work begins. Cancellation during native process creation completes only after the resulting child has been killed, its master descriptor closed, and the child reaped. `WaitForExitAsync` and `DisposeAsync` are genuinely awaitable; async disposal retires reactor ownership before closing the master descriptor and waits for child reaping. The synchronous `Stream`, `WaitForExit`, and `Dispose` methods remain blocking compatibility APIs. Resize and kill stay synchronous because their `ioctl` and signal syscalls are immediate.
 
 Reads and writes are queued FIFO per connection. Cancellation wakes the reactor promptly. If a write is cancelled after the kernel accepted part of it, those bytes cannot be rolled back; the remaining bytes are not written.
 
@@ -49,7 +51,7 @@ var options = new PtyOptions
     Rows = 30,
 };
 
-using IPtyConnection terminal = await PtyProvider.SpawnAsync(
+await using IPtyConnection terminal = await PtyProvider.SpawnAsync(
     options,
     CancellationToken.None);
 
