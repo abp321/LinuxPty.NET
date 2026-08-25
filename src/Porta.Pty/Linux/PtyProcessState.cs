@@ -201,7 +201,10 @@ namespace Porta.Pty.Linux
                     return false;
                 }
 
-                PtyWaitResult result = pty_wait_child(this.pid, NonBlockingWait);
+                PtyWaitResult result = pty_wait_child(
+                    this.pid,
+                    this.pidFileDescriptor,
+                    NonBlockingWait);
                 if (result.State == PtyWaitState.Running)
                 {
                     return false;
@@ -212,7 +215,7 @@ namespace Porta.Pty.Linux
                 {
                     exitCode = result.ExitCode;
                 }
-                else if (result.State == PtyWaitState.Signaled)
+                else if (result.State is PtyWaitState.Signaled or PtyWaitState.Unavailable)
                 {
                     exitCode = 0;
                 }
@@ -287,6 +290,7 @@ namespace Porta.Pty.Linux
 
         internal void ReapSynchronouslyAfterTrackingFailure()
         {
+            int pidFd;
             lock (this.reapGate)
             {
                 if (this.lifetimeState != LifetimeState.Unowned)
@@ -297,9 +301,10 @@ namespace Porta.Pty.Linux
                 // Claim reaping only after every signal operation that was already
                 // using the pidfd has left the same gate.
                 this.lifetimeState = LifetimeState.Reaping;
+                pidFd = this.pidFileDescriptor;
             }
 
-            PtyWaitResult result = pty_wait_child(this.pid, nonBlocking: 0);
+            PtyWaitResult result = pty_wait_child(this.pid, pidFd, nonBlocking: 0);
 
             int exitCode = 0;
             Exception? failure = null;
@@ -307,7 +312,7 @@ namespace Porta.Pty.Linux
             {
                 exitCode = result.ExitCode;
             }
-            else if (result.State == PtyWaitState.Signaled)
+            else if (result.State is PtyWaitState.Signaled or PtyWaitState.Unavailable)
             {
                 exitCode = 0;
             }

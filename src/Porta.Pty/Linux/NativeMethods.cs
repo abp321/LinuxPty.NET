@@ -30,6 +30,7 @@ namespace Porta.Pty.Linux
             Exited = 1,
             Signaled = 2,
             Failed = 3,
+            Unavailable = 4,
         }
 
         [StructLayout(LayoutKind.Explicit, Size = 20)]
@@ -81,11 +82,12 @@ namespace Porta.Pty.Linux
         }
 
         // The source-generated marshaller cannot preserve null-terminated UTF-8
-        // char** argv and environment-mutation arrays without custom marshalling.
+        // char** argv and environment arrays without custom marshalling.
         [DllImport(LibPortaPty)]
         internal static extern PtySpawnResult pty_spawn(
             [MarshalAs(UnmanagedType.LPStr)] string file,
             [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPStr)] string?[] argv,
+            [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPStr)] string?[] inheritedEnvironment,
             [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPStr)] string?[]? environmentMutations,
             [MarshalAs(UnmanagedType.LPStr)] string? workingDir,
             ushort rows,
@@ -98,7 +100,10 @@ namespace Porta.Pty.Linux
         internal static partial int pty_kill(int pid, int signal);
 
         [LibraryImport(LibPortaPty)]
-        internal static partial PtyWaitResult pty_wait_child(int pid, int nonBlocking);
+        internal static partial PtyWaitResult pty_wait_child(
+            int pid,
+            int pidFd,
+            int nonBlocking);
 
         [LibraryImport(LibPortaPty, SetLastError = true)]
         internal static partial int pty_pidfd_send_signal(int pidFd, int signal);

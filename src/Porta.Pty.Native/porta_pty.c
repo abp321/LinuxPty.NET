@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <pty.h>
 #include <signal.h>
@@ -26,6 +27,9 @@
 #include <unistd.h>
 
 #define PTY_EXPORT __attribute__((visibility("default")))
+
+/* Linux's P_PIDFD id type, including on headers predating Linux 5.4. */
+#define PTY_P_PIDFD 3
 
 /*
  * Linux assigned these syscall numbers consistently on x86-64 and arm64.
@@ -111,6 +115,7 @@ enum {
     PTY_WAIT_EXITED = 1,
     PTY_WAIT_SIGNALED = 2,
     PTY_WAIT_FAILED = 3,
+    PTY_WAIT_UNAVAILABLE = 4,
 };
 
 /*
@@ -120,6 +125,7 @@ enum {
 static pthread_mutex_t pty_spawn_lock = PTHREAD_MUTEX_INITIALIZER;
 static int pidfds_unavailable;
 static int pidfds_unavailable_error;
+static int pidfd_wait_supported;
 
 extern char** environ;
 
@@ -175,9 +181,72 @@ static int open_pid_fd(pid_t pid)
 #endif
 }
 
-static pty_wait_result_t wait_for_child(pid_t pid, int non_blocking)
+static int probe_pid_fd_wait_support(void)
+{
+    siginfo_t info;
+    memset(&info, 0, sizeof(info));
+
+    int wait_result;
+    do {
+        wait_result = waitid(
+            (idtype_t)PTY_P_PIDFD,
+            (id_t)INT_MAX,
+            &info,
+            WEXITED | WNOHANG);
+    } while (wait_result == -1 && errno == EINTR);
+
+    /*
+     * A kernel that recognizes P_PIDFD resolves the deliberately invalid file
+     * descriptor and returns EBADF. Older kernels reject the id type with
+     * EINVAL. Probe before pidfd_open so unsupported waiting never causes a
+     * stable identity to be acquired and then downgraded to a numeric-PID wait.
+     */
+    if (wait_result == -1 && errno == EBADF) {
+        return 0;
+    }
+
+    return wait_result == -1 ? errno : EIO;
+}
+
+static pty_wait_result_t wait_for_child(
+    pid_t pid,
+    int pid_fd,
+    int non_blocking)
 {
     pty_wait_result_t result = { PTY_WAIT_FAILED, 0, 0, 0 };
+    if (pid_fd >= 0) {
+        siginfo_t info;
+        int wait_result;
+        do {
+            memset(&info, 0, sizeof(info));
+            wait_result = waitid(
+                (idtype_t)PTY_P_PIDFD,
+                (id_t)pid_fd,
+                &info,
+                WEXITED | (non_blocking ? WNOHANG : 0));
+        } while (wait_result == -1 && errno == EINTR);
+
+        if (wait_result == -1) {
+            result.error = errno;
+            if (result.error == ECHILD) {
+                result.state = PTY_WAIT_UNAVAILABLE;
+            }
+        } else if (info.si_pid == 0) {
+            result.state = PTY_WAIT_RUNNING;
+        } else if (info.si_code == CLD_EXITED) {
+            result.state = PTY_WAIT_EXITED;
+            result.exit_code = info.si_status;
+        } else if (info.si_code == CLD_KILLED
+            || info.si_code == CLD_DUMPED) {
+            result.state = PTY_WAIT_SIGNALED;
+            result.signal_number = info.si_status;
+        } else {
+            result.error = EIO;
+        }
+
+        return result;
+    }
+
     int status = 0;
     pid_t waited_pid;
     do {
@@ -188,6 +257,9 @@ static pty_wait_result_t wait_for_child(pid_t pid, int non_blocking)
         result.state = PTY_WAIT_RUNNING;
     } else if (waited_pid == -1) {
         result.error = errno;
+        if (result.error == ECHILD) {
+            result.state = PTY_WAIT_UNAVAILABLE;
+        }
     } else if (WIFEXITED(status)) {
         result.state = PTY_WAIT_EXITED;
         result.exit_code = WEXITSTATUS(status);
@@ -237,40 +309,44 @@ static void remove_environment_key(
     }
 }
 
-static int apply_environment_mutation(
+static int apply_environment_entry(
     char** environment,
     size_t* count,
-    const char* mutation)
+    const char* entry,
+    int empty_means_unset)
 {
-    const char* separator = strchr(mutation, '=');
-    if (separator == NULL || separator == mutation) {
+    const char* separator = strchr(entry, '=');
+    if (separator == NULL || separator == entry) {
         return 0;
     }
 
-    size_t key_length = (size_t)(separator - mutation);
-    remove_environment_key(environment, count, mutation, key_length);
-    if (separator[1] == '\0') {
+    size_t key_length = (size_t)(separator - entry);
+    remove_environment_key(environment, count, entry, key_length);
+    if (empty_means_unset && separator[1] == '\0') {
         return 0;
     }
 
-    char* entry = strdup(mutation);
-    if (entry == NULL) {
+    char* copied_entry = strdup(entry);
+    if (copied_entry == NULL) {
         return ENOMEM;
     }
 
-    environment[*count] = entry;
+    environment[*count] = copied_entry;
     (*count)++;
     environment[*count] = NULL;
     return 0;
 }
 
 static int prepare_environment(
+    char* const inherited_environment[],
     char* const mutations[],
     char*** environment_out)
 {
     size_t inherited_count = 0;
-    while (environ[inherited_count] != NULL) {
-        inherited_count++;
+    if (inherited_environment != NULL) {
+        while (inherited_environment[inherited_count] != NULL) {
+            inherited_count++;
+        }
     }
 
     size_t mutation_count = 0;
@@ -280,30 +356,39 @@ static int prepare_environment(
         }
     }
 
-    if (inherited_count > SIZE_MAX - mutation_count - 2
-        || inherited_count + mutation_count + 2 > SIZE_MAX / sizeof(char*)) {
+    if (inherited_count > SIZE_MAX - mutation_count) {
         return ENOMEM;
     }
 
-    size_t capacity = inherited_count + mutation_count + 2;
+    size_t entry_capacity = inherited_count + mutation_count;
+    if (entry_capacity > SIZE_MAX - 2
+        || entry_capacity + 2 > SIZE_MAX / sizeof(char*)) {
+        return ENOMEM;
+    }
+
+    size_t capacity = entry_capacity + 2;
     char** environment = (char**)calloc(capacity, sizeof(char*));
     if (environment == NULL) {
         return ENOMEM;
     }
 
     size_t count = 0;
-    for (; count < inherited_count; count++) {
-        environment[count] = strdup(environ[count]);
-        if (environment[count] == NULL) {
-            free_environment(environment);
-            return ENOMEM;
-        }
+    int error = 0;
+    for (size_t index = 0; error == 0 && index < inherited_count; index++) {
+        error = apply_environment_entry(
+            environment,
+            &count,
+            inherited_environment[index],
+            0);
     }
 
-    int error = apply_environment_mutation(
-        environment,
-        &count,
-        "TERM=xterm-256color");
+    if (error == 0) {
+        error = apply_environment_entry(
+            environment,
+            &count,
+            "TERM=xterm-256color",
+            0);
+    }
     const char* fixed_unsets[] = {
         "TMUX",
         "TMUX_PANE",
@@ -327,7 +412,11 @@ static int prepare_environment(
     for (size_t index = 0;
         error == 0 && mutations != NULL && mutations[index] != NULL;
         index++) {
-        error = apply_environment_mutation(environment, &count, mutations[index]);
+        error = apply_environment_entry(
+            environment,
+            &count,
+            mutations[index],
+            1);
     }
 
     if (error != 0) {
@@ -370,13 +459,14 @@ static void initialize_terminal_settings(struct termios* term)
 /*
  * Spawns a process connected to a pseudoterminal.
  *
- * argv and environment_mutations are null-terminated arrays. Environment
- * entries use KEY=VALUE form, with an empty value meaning unset. The effective
- * inherited environment is captured immediately before forkpty().
+ * argv, inherited_environment, and environment_mutations are null-terminated
+ * arrays. Environment entries use KEY=VALUE form. Empty inherited values are
+ * preserved; an empty mutation value means unset.
  */
 PTY_EXPORT pty_spawn_result_t pty_spawn(
     const char* file,
     char* const argv[],
+    char* const inherited_environment[],
     char* const environment_mutations[],
     const char* working_dir,
     unsigned short rows,
@@ -397,6 +487,7 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
     char** child_environment = NULL;
     pthread_mutex_lock(&pty_spawn_lock);
     int environment_error = prepare_environment(
+        inherited_environment,
         environment_mutations,
         &child_environment);
     if (environment_error != 0) {
@@ -431,7 +522,7 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
     if (configure_error != 0) {
         kill(pid, SIGKILL);
         close(master_fd);
-        (void)wait_for_child(pid, 0);
+        (void)wait_for_child(pid, -1, 0);
 
         pthread_mutex_unlock(&pty_spawn_lock);
         free_environment(child_environment);
@@ -444,13 +535,25 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
     if (pidfds_unavailable) {
         pid_fd_error = pidfds_unavailable_error;
     } else {
-        pid_fd = open_pid_fd(pid);
-        if (pid_fd == -1) {
-            pid_fd_error = errno;
-            if (pid_fd_error == ENOSYS || pid_fd_error == EINVAL
-                || pid_fd_error == EPERM) {
+        if (!pidfd_wait_supported) {
+            pid_fd_error = probe_pid_fd_wait_support();
+            if (pid_fd_error == 0) {
+                pidfd_wait_supported = 1;
+            } else {
                 pidfds_unavailable = 1;
                 pidfds_unavailable_error = pid_fd_error;
+            }
+        }
+
+        if (!pidfds_unavailable) {
+            pid_fd = open_pid_fd(pid);
+            if (pid_fd == -1) {
+                pid_fd_error = errno;
+                if (pid_fd_error == ENOSYS || pid_fd_error == EINVAL
+                    || pid_fd_error == EPERM) {
+                    pidfds_unavailable = 1;
+                    pidfds_unavailable_error = pid_fd_error;
+                }
             }
         }
     }
@@ -713,9 +816,12 @@ PTY_EXPORT int pty_kill(int pid, int signal_number)
     return kill(pid, signal_number);
 }
 
-PTY_EXPORT pty_wait_result_t pty_wait_child(int pid, int non_blocking)
+PTY_EXPORT pty_wait_result_t pty_wait_child(
+    int pid,
+    int pid_fd,
+    int non_blocking)
 {
-    return wait_for_child(pid, non_blocking);
+    return wait_for_child(pid, pid_fd, non_blocking);
 }
 
 static int send_pid_fd_signal(int pid_fd, int signal_number)
@@ -755,19 +861,19 @@ PTY_EXPORT int pty_cleanup_untracked(int master_fd, int pid, int pid_fd)
         first_error = errno;
     }
 
+    pty_wait_result_t wait_result = wait_for_child(pid, pid_fd, 0);
+    if (wait_result.state == PTY_WAIT_FAILED
+        && first_error == 0) {
+        first_error = wait_result.error;
+    }
+
+    /* Never retry close after EINTR; either descriptor may already be reused. */
     if (master_fd >= 0 && close(master_fd) == -1 && first_error == 0) {
         first_error = errno;
     }
 
     if (pid_fd >= 0 && close(pid_fd) == -1 && first_error == 0) {
         first_error = errno;
-    }
-
-    pty_wait_result_t wait_result = wait_for_child(pid, 0);
-    if (wait_result.state == PTY_WAIT_FAILED
-        && wait_result.error != ECHILD
-        && first_error == 0) {
-        first_error = wait_result.error;
     }
 
     return first_error;

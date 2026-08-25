@@ -4,6 +4,8 @@
 namespace Porta.Pty.Linux
 {
     using System;
+    using System.Collections;
+    using System.Collections.Generic;
     using System.Linq;
     using System.Threading;
     using System.Threading.Tasks;
@@ -20,19 +22,17 @@ namespace Porta.Pty.Linux
         {
             string?[] terminalArgs = GetExecvpArgs(options);
 
-            string?[]? environmentMutations = null;
-            if (options.Environment.Count > 0)
-            {
-                environmentMutations = options.Environment
-                    .Select(pair => $"{pair.Key}={pair.Value}")
-                    .Concat(new string?[] { null })
-                    .ToArray();
-            }
+            string?[]? environmentMutations = GetEnvironmentMutations(options);
 
-            // This synchronous native call always runs on PtySpawnQueue's dedicated worker.
+            // This runs on PtySpawnQueue's dedicated worker. Capture the .NET
+            // managed process environment at execution time, immediately before
+            // entering the synchronous native spawn call.
+            string?[] inheritedEnvironment = GetInheritedEnvironment();
+
             PtySpawnResult result = pty_spawn(
                 options.App,
                 terminalArgs,
+                inheritedEnvironment,
                 environmentMutations,
                 options.Cwd,
                 (ushort)options.Rows,
@@ -106,6 +106,49 @@ namespace Porta.Pty.Linux
             Array.Copy(options.CommandLine, 0, result, 1, options.CommandLine.Length);
             result[0] = options.App;
             return result;
+        }
+
+        private static string?[] GetInheritedEnvironment()
+        {
+            IDictionary snapshot = Environment.GetEnvironmentVariables();
+            var entries = new List<string?>(snapshot.Count + 1);
+            foreach (DictionaryEntry pair in snapshot)
+            {
+                if (pair.Key is string key
+                    && pair.Value is string value
+                    && IsValidEnvironmentEntry(key, value))
+                {
+                    entries.Add($"{key}={value}");
+                }
+            }
+
+            entries.Sort(StringComparer.Ordinal);
+            entries.Add(null);
+            return entries.ToArray();
+        }
+
+        private static string?[]? GetEnvironmentMutations(PtyOptions options)
+        {
+            if (options.Environment.Count == 0)
+            {
+                return null;
+            }
+
+            string?[] entries = options.Environment
+                .Where(pair => IsValidEnvironmentEntry(pair.Key, pair.Value))
+                .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+                .Select(pair => $"{pair.Key}={pair.Value}")
+                .Concat(new string?[] { null })
+                .ToArray();
+            return entries.Length == 1 ? null : entries;
+        }
+
+        private static bool IsValidEnvironmentEntry(string key, string value)
+        {
+            return key.Length != 0
+                && !key.Contains('=')
+                && !key.Contains('\0')
+                && !value.Contains('\0');
         }
 
         private static string GetErrorMessage(int errno)
