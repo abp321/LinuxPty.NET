@@ -87,6 +87,7 @@ enum {
     PTY_CONTROL_STATUS_PIDFD = 1,
     PTY_CONTROL_STATUS_NO_PIDFD = 2,
     PTY_CONTROL_STATUS_RELEASE = 3,
+    PTY_CONTROL_STATUS_EXEC_FAILED = 4,
 };
 
 typedef struct {
@@ -629,14 +630,34 @@ static void reset_child_signals(void)
     (void)sigprocmask(SIG_SETMASK, &empty, NULL);
 }
 
-/* Runs in the forked child, after every descriptor it still needs is wired. */
-static void close_inherited_descriptors(void)
+/*
+ * Runs in the forked child, after every descriptor it still needs is wired.
+ * keep_fd is the control endpoint, which stays open (and CLOEXEC) so a failed
+ * exec can still report its errno; it is always at least 3.
+ */
+static void close_inherited_descriptors(int keep_fd)
 {
 #ifdef SYS_close_range
-    int result;
-    do {
-        result = (int)syscall(SYS_close_range, 3U, ~0U, 0U);
-    } while (result == -1 && errno == EINTR);
+    int result = 0;
+    if (keep_fd > 3) {
+        do {
+            result = (int)syscall(
+                SYS_close_range,
+                3U,
+                (unsigned int)(keep_fd - 1),
+                0U);
+        } while (result == -1 && errno == EINTR);
+    }
+
+    if (result == 0) {
+        do {
+            result = (int)syscall(
+                SYS_close_range,
+                (unsigned int)(keep_fd + 1),
+                ~0U,
+                0U);
+        } while (result == -1 && errno == EINTR);
+    }
 
     if (result == 0) {
         return;
@@ -649,7 +670,9 @@ static void close_inherited_descriptors(void)
     }
 
     for (int descriptor = 3; descriptor < (int)limit; descriptor++) {
-        (void)close(descriptor);
+        if (descriptor != keep_fd) {
+            (void)close(descriptor);
+        }
     }
 }
 
@@ -928,6 +951,24 @@ static int perform_child_handshake(
     return receive_release_message(control_fd);
 }
 
+/*
+ * Runs in the forked child once the control endpoint is the only channel left:
+ * a successful exec closes it (CLOEXEC) and the parent sees EOF instead.
+ */
+static __attribute__((noreturn)) void report_child_exec_failure(
+    int control_fd,
+    int failure_errno)
+{
+    pty_control_message_t message;
+    memset(&message, 0, sizeof(message));
+    message.magic = PTY_CONTROL_MAGIC;
+    message.status = PTY_CONTROL_STATUS_EXEC_FAILED;
+    message.error = failure_errno;
+    message.pid = (int32_t)getpid();
+    (void)send_control_message(control_fd, &message, -1);
+    _exit(failure_errno);
+}
+
 static void abort_spawned_child(
     pid_t pid,
     int master_fd,
@@ -1066,18 +1107,17 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
             _exit(handshake_error);
         }
 
-        close(descriptors[1]);
-        close_inherited_descriptors();
+        close_inherited_descriptors(descriptors[1]);
         reset_child_signals();
         environ = child_environment;
         if (working_dir != NULL && working_dir[0] != '\0') {
             if (chdir(working_dir) == -1) {
-                _exit(errno);
+                report_child_exec_failure(descriptors[1], errno);
             }
         }
 
         execvp(file, argv);
-        _exit(errno);
+        report_child_exec_failure(descriptors[1], errno);
     }
 
     close(slave_fd);
@@ -1121,6 +1161,31 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
         if (error == EPIPE || error == ECONNRESET) {
             /* The child endpoint is gone, so the child may already be reaped. */
             child_held = 0;
+        }
+    }
+
+    if (error == 0) {
+        /* CLOEXEC closes the child endpoint on a successful exec, so EOF here
+         * is the only proof exec happened; a message means it failed. */
+        pty_control_message_t exec_message;
+        int exec_fd = -1;
+        int exec_error = receive_control_message(
+            descriptors[0],
+            &exec_message,
+            &exec_fd);
+        if (exec_error == EPIPE || exec_error == ECONNRESET) {
+            child_held = 0;
+        } else if (exec_error != 0) {
+            error = exec_error;
+        } else if (exec_fd >= 0) {
+            close(exec_fd);
+            error = EPROTO;
+        } else if (exec_message.magic == PTY_CONTROL_MAGIC
+            && exec_message.status == PTY_CONTROL_STATUS_EXEC_FAILED
+            && exec_message.pid == (int32_t)pid) {
+            error = exec_message.error != 0 ? exec_message.error : EIO;
+        } else {
+            error = EPROTO;
         }
     }
 
