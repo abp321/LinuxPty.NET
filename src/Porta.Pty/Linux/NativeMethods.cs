@@ -23,7 +23,7 @@ namespace Porta.Pty.Linux
         internal const uint ReactorHangup = 8;
         internal const uint ReactorOneShot = 16;
 
-        private const string LibPortaPty = "libporta_pty";
+        private const string LibPortaPty = "liblinuxpty_net";
 
         internal enum PtyWaitState
         {

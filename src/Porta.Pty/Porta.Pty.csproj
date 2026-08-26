@@ -23,17 +23,17 @@
     <_LinuxPtyNativeRoot>$(MSBuildThisFileDirectory)../Porta.Pty.Native/output/runtimes/</_LinuxPtyNativeRoot>
     <_LinuxPtyBuildRid Condition="'$(RuntimeIdentifier)' != ''">$(RuntimeIdentifier)</_LinuxPtyBuildRid>
     <_LinuxPtyBuildRid Condition="'$(_LinuxPtyBuildRid)' == ''">$(NETCoreSdkRuntimeIdentifier)</_LinuxPtyBuildRid>
-    <_LinuxPtyBuildShim>$(_LinuxPtyNativeRoot)$(_LinuxPtyBuildRid)/native/libporta_pty.so</_LinuxPtyBuildShim>
+    <_LinuxPtyBuildShim>$(_LinuxPtyNativeRoot)$(_LinuxPtyBuildRid)/native/liblinuxpty_net.so</_LinuxPtyBuildShim>
   </PropertyGroup>
 
   <ItemGroup>
     <None Include="../../README.md" Pack="true" PackagePath="" />
     <None Include="../../LICENSE" Pack="true" PackagePath="" />
-    <None Include="$(_LinuxPtyNativeRoot)linux-x64/native/libporta_pty.so"
+    <None Include="$(_LinuxPtyNativeRoot)linux-x64/native/liblinuxpty_net.so"
           Pack="true"
           PackagePath="runtimes/linux-x64/native/"
           Condition="'$(_LinuxPtyBuildRid)' != 'linux-x64'" />
-    <None Include="$(_LinuxPtyNativeRoot)linux-arm64/native/libporta_pty.so"
+    <None Include="$(_LinuxPtyNativeRoot)linux-arm64/native/liblinuxpty_net.so"
           Pack="true"
           PackagePath="runtimes/linux-arm64/native/"
           Condition="'$(_LinuxPtyBuildRid)' != 'linux-arm64'" />
@@ -43,14 +43,14 @@
     <Content Include="$(_LinuxPtyBuildShim)"
              Pack="true"
              PackagePath="runtimes/$(_LinuxPtyBuildRid)/native/"
-             Link="libporta_pty.so"
+             Link="liblinuxpty_net.so"
              CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <Target Name="ValidateLinuxPtyNativeAssets" BeforeTargets="Pack">
-    <Error Condition="!Exists('$(_LinuxPtyNativeRoot)linux-x64/native/libporta_pty.so')"
+    <Error Condition="!Exists('$(_LinuxPtyNativeRoot)linux-x64/native/liblinuxpty_net.so')"
            Text="The linux-x64 native PTY shim must be built before packing." />
-    <Error Condition="!Exists('$(_LinuxPtyNativeRoot)linux-arm64/native/libporta_pty.so')"
+    <Error Condition="!Exists('$(_LinuxPtyNativeRoot)linux-arm64/native/liblinuxpty_net.so')"
            Text="The linux-arm64 native PTY shim must be built before packing." />
   </Target>
 </Project>

@@ -15,6 +15,7 @@ set_target_properties(porta_pty PROPERTIES
     C_EXTENSIONS YES
     C_VISIBILITY_PRESET hidden
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    OUTPUT_NAME "linuxpty_net"
     PREFIX "lib"
     SUFFIX ".so"
 )

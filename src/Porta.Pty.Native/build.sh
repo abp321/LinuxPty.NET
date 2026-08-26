@@ -37,7 +37,7 @@ fi
 
 build_dir="$script_dir/build/$rid"
 output_dir="$script_dir/output/runtimes/$rid/native"
-library="$build_dir/bin/libporta_pty.so"
+library="$build_dir/bin/liblinuxpty_net.so"
 
 rm -rf "$build_dir"
 mkdir -p "$build_dir"
@@ -62,6 +62,6 @@ if [[ "$elf_class" != "ELF64" || "$machine" != "$expected_machine" ]]; then
 fi
 
 mkdir -p "$output_dir"
-cp "$library" "$output_dir/libporta_pty.so"
+cp "$library" "$output_dir/liblinuxpty_net.so"
 
-echo "Built $output_dir/libporta_pty.so"
+echo "Built $output_dir/liblinuxpty_net.so"

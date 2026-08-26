@@ -56,7 +56,7 @@ jobs:
       - name: Verify native PTY shim
         env:
           EXPECTED_MACHINE: ${{ matrix.machine }}
-          LIBRARY: src/Porta.Pty.Native/output/runtimes/${{ matrix.rid }}/native/libporta_pty.so
+          LIBRARY: src/Porta.Pty.Native/output/runtimes/${{ matrix.rid }}/native/liblinuxpty_net.so
         run: |
           set -euo pipefail
 
@@ -125,7 +125,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: native-${{ matrix.rid }}
-          path: src/Porta.Pty.Native/output/runtimes/${{ matrix.rid }}/native/libporta_pty.so
+          path: src/Porta.Pty.Native/output/runtimes/${{ matrix.rid }}/native/liblinuxpty_net.so
           if-no-files-found: error
           retention-days: 1
 
@@ -206,8 +206,8 @@ jobs:
             README.md \
             LICENSE \
             lib/net10.0/LinuxPty.NET.dll \
-            runtimes/linux-x64/native/libporta_pty.so \
-            runtimes/linux-arm64/native/libporta_pty.so
+            runtimes/linux-x64/native/liblinuxpty_net.so \
+            runtimes/linux-arm64/native/liblinuxpty_net.so
           do
             grep -Fxq "$required" <<<"$listing" || {
               echo "Package entry is missing: $required" >&2
@@ -312,10 +312,10 @@ jobs:
           }
 
           verify_native \
-            runtimes/linux-x64/native/libporta_pty.so \
+            runtimes/linux-x64/native/liblinuxpty_net.so \
             'Advanced Micro Devices X86-64'
           verify_native \
-            runtimes/linux-arm64/native/libporta_pty.so \
+            runtimes/linux-arm64/native/liblinuxpty_net.so \
             AArch64
 
       - name: Upload package
