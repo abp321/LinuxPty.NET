@@ -40,6 +40,29 @@ namespace Porta.Pty
                 throw new ArgumentNullException(nameof(options.CommandLine));
             }
 
+            for (int i = 0; i < options.CommandLine.Length; i++)
+            {
+                string argument = options.CommandLine[i];
+                if (argument is null)
+                {
+                    throw new ArgumentException(
+                        $"Command line element at index {i} is null.",
+                        nameof(options.CommandLine));
+                }
+
+                if (argument.Contains('\0'))
+                {
+                    throw new ArgumentException(
+                        $"Command line element at index {i} contains an embedded null character.",
+                        nameof(options.CommandLine));
+                }
+            }
+
+            ArgumentOutOfRangeException.ThrowIfNegative(options.Rows, nameof(options.Rows));
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(options.Rows, ushort.MaxValue, nameof(options.Rows));
+            ArgumentOutOfRangeException.ThrowIfNegative(options.Cols, nameof(options.Cols));
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(options.Cols, ushort.MaxValue, nameof(options.Cols));
+
             if (options.Environment == null)
             {
                 throw new ArgumentNullException(nameof(options.Environment));

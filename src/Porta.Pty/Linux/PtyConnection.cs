@@ -113,6 +113,10 @@ namespace Porta.Pty.Linux
 
         public void Resize(int cols, int rows)
         {
+            ArgumentOutOfRangeException.ThrowIfNegative(cols);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(cols, ushort.MaxValue);
+            ArgumentOutOfRangeException.ThrowIfNegative(rows);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(rows, ushort.MaxValue);
             lock (this.lifetimeGate)
             {
                 ObjectDisposedException.ThrowIf(this.isDisposed, this);
