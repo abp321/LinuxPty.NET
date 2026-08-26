@@ -23,7 +23,7 @@ namespace Porta.Pty.Linux
         private const int MaxCallsPerDispatch = 16;
 
         // A parked operation completes at this much so one busy descriptor cannot hold the reactor for a full 64 KB fill while a small ready read waits; the consumer's next read drains the rest inline.
-        private const int ReactorFillQuantum = 8 * 1024;
+        private const int ReactorFillQuantum = 4 * 1024;
 
         private const int MaxWriteSize = 16 * 1024;
         private const int InlineFree = 0;
@@ -34,7 +34,7 @@ namespace Porta.Pty.Linux
         private const int InlineYieldInterval = 2;
 
         // An inline read completes at this much rather than filling the caller's whole buffer, so a streaming consumer reaches the yield interval often enough for interactive work to interleave.
-        private const int InlineFillQuantum = 8 * 1024;
+        private const int InlineFillQuantum = 4 * 1024;
 
         private readonly EpollReactor reactor;
         private readonly Lock stoppedReactorGate = new();
