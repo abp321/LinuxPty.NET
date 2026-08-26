@@ -33,6 +33,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
@@ -1151,15 +1152,18 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
 
 PTY_EXPORT int pty_reactor_create(
     uint64_t wake_token,
+    uint64_t timer_token,
     int* epoll_fd_out,
-    int* wake_fd_out)
+    int* wake_fd_out,
+    int* timer_fd_out)
 {
-    if (epoll_fd_out == NULL || wake_fd_out == NULL) {
+    if (epoll_fd_out == NULL || wake_fd_out == NULL || timer_fd_out == NULL) {
         return EINVAL;
     }
 
     *epoll_fd_out = -1;
     *wake_fd_out = -1;
+    *timer_fd_out = -1;
 
     int epoll_fd;
     do {
@@ -1198,8 +1202,38 @@ PTY_EXPORT int pty_reactor_create(
         return error;
     }
 
+    int timer_fd;
+    do {
+        timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    } while (timer_fd == -1 && errno == EINTR);
+
+    if (timer_fd == -1) {
+        int error = errno;
+        close(wake_fd);
+        close(epoll_fd);
+        return error;
+    }
+
+    struct epoll_event timer_event;
+    memset(&timer_event, 0, sizeof(timer_event));
+    timer_event.events = EPOLLIN;
+    timer_event.data.u64 = timer_token;
+
+    do {
+        result = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_fd, &timer_event);
+    } while (result == -1 && errno == EINTR);
+
+    if (result == -1) {
+        int error = errno;
+        close(timer_fd);
+        close(wake_fd);
+        close(epoll_fd);
+        return error;
+    }
+
     *epoll_fd_out = epoll_fd;
     *wake_fd_out = wake_fd;
+    *timer_fd_out = timer_fd;
     return 0;
 }
 
@@ -1335,6 +1369,22 @@ PTY_EXPORT int pty_reactor_drain(int wake_fd)
     }
 
     return count == -1 ? errno : EIO;
+}
+
+PTY_EXPORT int pty_reactor_set_timer(int timer_fd, int milliseconds)
+{
+    struct itimerspec timing;
+    memset(&timing, 0, sizeof(timing));
+    if (milliseconds > 0) {
+        timing.it_value.tv_sec = milliseconds / 1000;
+        timing.it_value.tv_nsec = (long)(milliseconds % 1000) * 1000000L;
+    }
+
+    if (timerfd_settime(timer_fd, 0, &timing, NULL) == -1) {
+        return errno;
+    }
+
+    return 0;
 }
 
 PTY_EXPORT int pty_io_read(

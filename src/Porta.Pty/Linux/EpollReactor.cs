@@ -18,6 +18,7 @@ namespace Porta.Pty.Linux
     internal sealed class EpollReactor
     {
         private const ulong WakeToken = 0;
+        private const ulong TimerToken = 1;
         private const int EventCapacity = 64;
         private const int MaxCommandsPerDrain = 16;
         private const int ENOENT = 2;
@@ -27,6 +28,7 @@ namespace Porta.Pty.Linux
 
         private readonly int epollFd;
         private readonly int wakeFd;
+        private readonly int timerFd;
         private readonly Queue<ReactorCommand> commands = new();
         private readonly Lock commandGate = new();
         private readonly Dictionary<ulong, PtyIoContext> activeContexts = new();
@@ -40,7 +42,12 @@ namespace Porta.Pty.Linux
 
         private unsafe EpollReactor()
         {
-            int error = pty_reactor_create(WakeToken, out this.epollFd, out this.wakeFd);
+            int error = pty_reactor_create(
+                WakeToken,
+                TimerToken,
+                out this.epollFd,
+                out this.wakeFd,
+                out this.timerFd);
             if (error != 0)
             {
                 throw CreateIOException("Creating the PTY epoll reactor", error);
@@ -61,6 +68,7 @@ namespace Porta.Pty.Linux
             catch
             {
                 NativeMemory.Free(this.events);
+                pty_close(this.timerFd);
                 pty_close(this.wakeFd);
                 pty_close(this.epollFd);
                 throw;
@@ -438,6 +446,7 @@ namespace Porta.Pty.Linux
             finally
             {
                 NativeMemory.Free(this.events);
+                _ = pty_close(this.timerFd);
                 _ = pty_close(this.wakeFd);
                 _ = pty_close(this.epollFd);
             }
@@ -599,7 +608,7 @@ namespace Porta.Pty.Linux
             {
                 token = unchecked((ulong)Interlocked.Increment(ref this.nextToken));
             }
-            while (token == WakeToken);
+            while (token == WakeToken || token == TimerToken);
 
             return token;
         }

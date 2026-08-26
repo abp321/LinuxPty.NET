@@ -9,6 +9,7 @@
         pty_reactor_control;
         pty_reactor_create;
         pty_reactor_drain;
+        pty_reactor_set_timer;
         pty_reactor_wait;
         pty_reactor_wake;
         pty_resize;

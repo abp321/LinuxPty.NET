@@ -144,8 +144,10 @@ namespace Porta.Pty.Linux
         [LibraryImport(LibPortaPty)]
         internal static partial int pty_reactor_create(
             ulong wakeToken,
+            ulong timerToken,
             out int epollFd,
-            out int wakeFd);
+            out int wakeFd,
+            out int timerFd);
 
         [LibraryImport(LibPortaPty)]
         internal static partial int pty_reactor_control(
@@ -167,6 +169,9 @@ namespace Porta.Pty.Linux
 
         [LibraryImport(LibPortaPty)]
         internal static partial int pty_reactor_drain(int wakeFd);
+
+        [LibraryImport(LibPortaPty)]
+        internal static partial int pty_reactor_set_timer(int timerFd, int milliseconds);
 
         [LibraryImport(LibPortaPty)]
         internal static partial int pty_io_read(
