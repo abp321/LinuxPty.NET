@@ -635,6 +635,14 @@ namespace Porta.Pty.Linux
             // callback is owed and the caller's loop can be released.
             lock (this.commandGate)
             {
+                if (this.commands.Count != 0)
+                {
+                    // A queued command is live work (a declined-reap fallback handoff, say). The
+                    // wake registration is still armed, so it drains and the drain re-evaluates
+                    // idleness once the queue empties.
+                    return;
+                }
+
                 this.fatalError ??= new IOException("The PTY epoll reactor has stopped.");
             }
 
@@ -738,7 +746,13 @@ namespace Porta.Pty.Linux
                 {
                     throw CreateIOException("Rescheduling PTY reactor commands", error);
                 }
+
+                return;
             }
+
+            // Closes the deferral window the pending-command guard opens: a drained command that
+            // shrinks no ownership set reaches no other idle-close point.
+            this.CloseExternalBackendIfIdle();
         }
 
         private void ScanFallbackProcesses()

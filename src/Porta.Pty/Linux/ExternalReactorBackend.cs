@@ -61,8 +61,10 @@ namespace Porta.Pty.Linux
             {
                 try
                 {
-                    createdTimer?.Dispose();
-                    createdWake?.Dispose();
+                    // Per-item tolerance, as in Close: a throwing caller Dispose must not skip the
+                    // other rollback disposal nor replace the setup exception rethrown below.
+                    TryDispose(createdTimer);
+                    TryDispose(createdWake);
                 }
                 finally
                 {
@@ -163,11 +165,11 @@ namespace Porta.Pty.Linux
             }
         }
 
-        private static void TryDispose(IPtyFdRegistration registration)
+        private static void TryDispose(IPtyFdRegistration? registration)
         {
             try
             {
-                registration.Dispose();
+                registration?.Dispose();
             }
             catch
             {
