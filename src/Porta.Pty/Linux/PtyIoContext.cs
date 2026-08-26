@@ -55,6 +55,11 @@ namespace Porta.Pty.Linux
         private Exception? writeError;
         private Task? stopTask;
 
+        // Deliberately synchronous continuations: the waiter is library code that must resume on
+        // the releasing thread so a synchronously blocked Dispose never waits on a ThreadPool slot.
+        private TaskCompletionSource? readRetirement;
+        private TaskCompletionSource? writeRetirement;
+
         private PtyIoContext(int fileDescriptor, EpollReactor reactor)
         {
             this.FileDescriptor = fileDescriptor;
@@ -107,7 +112,7 @@ namespace Porta.Pty.Linux
 
             if (inlineClaimed)
             {
-                Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
+                this.SignalReadInlineReleased();
                 this.KickReadsOnReactor();
             }
 
@@ -153,7 +158,7 @@ namespace Porta.Pty.Linux
 
             if (inlineClaimed)
             {
-                Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
+                this.SignalWriteInlineReleased();
                 this.KickWritesOnReactor();
             }
 
@@ -181,6 +186,14 @@ namespace Porta.Pty.Linux
                 return Task.CompletedTask;
             }
 
+            Task retire = readSide
+                ? this.RetireReadInlineOwnerAsync()
+                : this.RetireWriteInlineOwnerAsync();
+            if (!retire.IsCompletedSuccessfully)
+            {
+                return this.CloseSideAfterRetirementAsync(retire, readSide);
+            }
+
             try
             {
                 return this.reactor.CloseSideAsync(this, readSide);
@@ -203,8 +216,10 @@ namespace Porta.Pty.Linux
                 }
 
                 Interlocked.Exchange(ref this.stopRequested, 1);
-                this.PoisonInlineOwners();
-                this.stopTask = this.reactor.StopAsync(this);
+                Task retire = this.RetireInlineOwnersAsync();
+                this.stopTask = retire.IsCompletedSuccessfully
+                    ? this.reactor.StopAsync(this)
+                    : this.StopAfterRetirementAsync(retire);
                 return this.stopTask;
             }
         }
@@ -429,21 +444,98 @@ namespace Porta.Pty.Linux
             }
         }
 
-        private void PoisonInlineOwners()
+        private void SignalReadInlineReleased()
         {
-            // The master fd is closed only after StopAsync completes, so no inline syscall may
-            // still be running when this returns. A holder gives the slot up within one
-            // nonblocking syscall of accepting going 0.
-            var readSpin = default(SpinWait);
-            while (Interlocked.CompareExchange(ref this.readInlineOwner, InlineStopped, InlineFree) == InlineHeld)
-            {
-                readSpin.SpinOnce();
-            }
+            // A CAS, never an Exchange: a release must never overwrite InlineStopped.
+            Interlocked.CompareExchange(ref this.readInlineOwner, InlineFree, InlineHeld);
+            Volatile.Read(ref this.readRetirement)?.TrySetResult();
+        }
 
-            var writeSpin = default(SpinWait);
-            while (Interlocked.CompareExchange(ref this.writeInlineOwner, InlineStopped, InlineFree) == InlineHeld)
+        private void SignalWriteInlineReleased()
+        {
+            Interlocked.CompareExchange(ref this.writeInlineOwner, InlineFree, InlineHeld);
+            Volatile.Read(ref this.writeRetirement)?.TrySetResult();
+        }
+
+        // Clear-and-loop: a late claimant that passed the entry guards before the close or stop
+        // flags were written can re-claim between a release and our CAS. It is bounded to at most
+        // one nonblocking syscall (the flags are already set, and the fd stays open until
+        // StopAsync's task completes, so the straggler syscall is fd-safe) and its release signals
+        // a fresh iteration.
+        private async Task RetireReadInlineOwnerAsync()
+        {
+            while (true)
             {
-                writeSpin.SpinOnce();
+                int prior = Interlocked.CompareExchange(ref this.readInlineOwner, InlineStopped, InlineFree);
+                if (prior == InlineFree || prior == InlineStopped)
+                {
+                    return;
+                }
+
+                var tcs = new TaskCompletionSource();
+                TaskCompletionSource? existing =
+                    Interlocked.CompareExchange(ref this.readRetirement, tcs, null);
+                TaskCompletionSource waiter = existing ?? tcs;
+                prior = Interlocked.CompareExchange(ref this.readInlineOwner, InlineStopped, InlineFree);
+                if (prior == InlineFree || prior == InlineStopped)
+                {
+                    Interlocked.CompareExchange(ref this.readRetirement, null, waiter);
+                    return;
+                }
+
+                await waiter.Task.ConfigureAwait(false);
+                Interlocked.CompareExchange(ref this.readRetirement, null, waiter);
+            }
+        }
+
+        private async Task RetireWriteInlineOwnerAsync()
+        {
+            while (true)
+            {
+                int prior = Interlocked.CompareExchange(ref this.writeInlineOwner, InlineStopped, InlineFree);
+                if (prior == InlineFree || prior == InlineStopped)
+                {
+                    return;
+                }
+
+                var tcs = new TaskCompletionSource();
+                TaskCompletionSource? existing =
+                    Interlocked.CompareExchange(ref this.writeRetirement, tcs, null);
+                TaskCompletionSource waiter = existing ?? tcs;
+                prior = Interlocked.CompareExchange(ref this.writeInlineOwner, InlineStopped, InlineFree);
+                if (prior == InlineFree || prior == InlineStopped)
+                {
+                    Interlocked.CompareExchange(ref this.writeRetirement, null, waiter);
+                    return;
+                }
+
+                await waiter.Task.ConfigureAwait(false);
+                Interlocked.CompareExchange(ref this.writeRetirement, null, waiter);
+            }
+        }
+
+        private async Task RetireInlineOwnersAsync()
+        {
+            await this.RetireReadInlineOwnerAsync().ConfigureAwait(false);
+            await this.RetireWriteInlineOwnerAsync().ConfigureAwait(false);
+        }
+
+        private async Task StopAfterRetirementAsync(Task retire)
+        {
+            await retire.ConfigureAwait(false);
+            await this.reactor.StopAsync(this).ConfigureAwait(false);
+        }
+
+        private async Task CloseSideAfterRetirementAsync(Task retire, bool readSide)
+        {
+            try
+            {
+                await retire.ConfigureAwait(false);
+                await this.reactor.CloseSideAsync(this, readSide).ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                this.StopAfterReactorFailure(exception);
             }
         }
 
@@ -493,7 +585,7 @@ namespace Porta.Pty.Linux
             }
             catch (Exception exception)
             {
-                Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
+                this.SignalReadInlineReleased();
                 operation.CompleteException(exception);
                 this.KickReadsOnReactor();
             }
@@ -548,7 +640,7 @@ namespace Porta.Pty.Linux
             }
             catch (Exception exception)
             {
-                Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
+                this.SignalWriteInlineReleased();
                 operation.CompleteException(exception);
                 this.KickWritesOnReactor();
             }
@@ -559,7 +651,7 @@ namespace Porta.Pty.Linux
         private ValueTask<int> CompleteReadInline(int result)
         {
             Interlocked.Decrement(ref this.readOpsInFlight);
-            Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
+            this.SignalReadInlineReleased();
             this.KickReadsOnReactor();
             return new ValueTask<int>(result);
         }
@@ -567,21 +659,21 @@ namespace Porta.Pty.Linux
         private ValueTask CompleteWriteInline()
         {
             Interlocked.Decrement(ref this.writeOpsInFlight);
-            Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
+            this.SignalWriteInlineReleased();
             this.KickWritesOnReactor();
             return ValueTask.CompletedTask;
         }
 
         private void ReleaseReadInline()
         {
-            Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
+            this.SignalReadInlineReleased();
             Interlocked.Decrement(ref this.readOpsInFlight);
             this.KickReadsOnReactor();
         }
 
         private void ReleaseWriteInline()
         {
-            Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
+            this.SignalWriteInlineReleased();
             Interlocked.Decrement(ref this.writeOpsInFlight);
             this.KickWritesOnReactor();
         }
@@ -632,7 +724,7 @@ namespace Porta.Pty.Linux
 
         private void EnqueueReadFallbackOnReactor(ReadOperation operation)
         {
-            Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
+            this.SignalReadInlineReleased();
             if (!operation.IsCompleted)
             {
                 if (operation.IsCancellationRequested)
@@ -673,7 +765,7 @@ namespace Porta.Pty.Linux
 
         private void EnqueueWriteFallbackOnReactor(WriteOperation operation)
         {
-            Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
+            this.SignalWriteInlineReleased();
             if (!operation.IsCompleted)
             {
                 if (operation.IsCancellationRequested)
