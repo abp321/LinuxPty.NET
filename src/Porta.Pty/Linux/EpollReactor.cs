@@ -30,9 +30,7 @@ namespace Porta.Pty.Linux
         private static readonly Lock SharedGate = new();
         private static EpollReactor? shared;
 
-        private readonly int epollFd;
-        private readonly int wakeFd;
-        private readonly int timerFd;
+        private readonly IReactorBackend backend;
         private readonly Queue<ReactorCommand> commands = new();
         private readonly Lock commandGate = new();
         private readonly Dictionary<ulong, PtyIoContext> activeContexts = new();
@@ -50,19 +48,9 @@ namespace Porta.Pty.Linux
         private bool fallbackRegistered;
         private Exception? fatalError;
 
-        private unsafe EpollReactor()
+        private unsafe EpollReactor(IReactorBackend backend)
         {
-            int error = pty_reactor_create(
-                WakeToken,
-                TimerToken,
-                out this.epollFd,
-                out this.wakeFd,
-                out this.timerFd);
-            if (error != 0)
-            {
-                throw CreateIOException("Creating the PTY epoll reactor", error);
-            }
-
+            this.backend = backend;
             try
             {
                 this.thread = new Thread(this.Run)
@@ -77,9 +65,7 @@ namespace Porta.Pty.Linux
             catch
             {
                 NativeMemory.Free(this.events);
-                pty_close(this.timerFd);
-                pty_close(this.wakeFd);
-                pty_close(this.epollFd);
+                backend.Close();
                 throw;
             }
         }
@@ -90,7 +76,7 @@ namespace Porta.Pty.Linux
             {
                 lock (SharedGate)
                 {
-                    return shared ??= new EpollReactor();
+                    return shared ??= new EpollReactor(new EpollReactorBackend(WakeToken, TimerToken));
                 }
             }
         }
@@ -141,12 +127,7 @@ namespace Porta.Pty.Linux
                     token = this.AllocateToken();
                     int error = process.RegisterWithReactor(
                         token,
-                        pidFd => pty_reactor_control(
-                            this.epollFd,
-                            ReactorAdd,
-                            pidFd,
-                            token,
-                            ReactorRead));
+                        pidFd => this.backend.AddInterest(pidFd, token, ReactorRead));
                     if (error != 0)
                     {
                         throw CreateIOException("Registering a pidfd with epoll", error);
@@ -179,12 +160,7 @@ namespace Porta.Pty.Linux
                     {
                         process.RollBackReactorRegistration(
                             token,
-                            pidFd => _ = pty_reactor_control(
-                                this.epollFd,
-                                ReactorDelete,
-                                pidFd,
-                                token,
-                                0));
+                            pidFd => _ = this.backend.RemoveInterest(pidFd, token));
                     }
 
                     completion.TrySetResult(exception);
@@ -296,9 +272,7 @@ namespace Porta.Pty.Linux
                 }
 
                 ulong token = this.AllocateToken();
-                int addError = pty_reactor_control(
-                    this.epollFd,
-                    ReactorAdd,
+                int addError = this.backend.AddInterest(
                     context.FileDescriptor,
                     token,
                     desiredInterest | ReactorOneShot);
@@ -321,9 +295,7 @@ namespace Porta.Pty.Linux
                 return;
             }
 
-            int modifyError = pty_reactor_control(
-                this.epollFd,
-                ReactorModify,
+            int modifyError = this.backend.ModifyInterest(
                 context.FileDescriptor,
                 context.ActiveToken,
                 desiredInterest | ReactorOneShot);
@@ -336,6 +308,79 @@ namespace Porta.Pty.Linux
         internal static IOException CreateIOException(string operation, int error)
         {
             return new IOException($"{operation} failed with error {error} ({new Win32Exception(error).Message}).");
+        }
+
+        /// <summary>
+        /// Runs one reactor iteration over the <paramref name="count"/> events the backend reported
+        /// into the engine-owned buffer: reserved-token detection, the wake and timer drains, the
+        /// pre-dispatch command drain, readiness dispatch, and the fallback reap scan.
+        /// </summary>
+        internal unsafe void ProcessReadyBatch(int count)
+        {
+            bool wakeReady = false;
+            bool timerFired = false;
+            for (int index = 0; index < count; index++)
+            {
+                ulong token = this.events[index].Token;
+                if (token == WakeToken)
+                {
+                    wakeReady = true;
+                }
+                else if (token == TimerToken)
+                {
+                    timerFired = true;
+                }
+            }
+
+            if (wakeReady)
+            {
+                int error = this.backend.DrainWake();
+                if (error != 0)
+                {
+                    throw CreateIOException("Draining the PTY reactor wakeup", error);
+                }
+            }
+
+            if (timerFired)
+            {
+                this.fallbackTimerArmed = false;
+                int error = this.backend.DrainTimer();
+                if (error != 0)
+                {
+                    throw CreateIOException("Draining the PTY fallback poll timer", error);
+                }
+            }
+
+            // Cancellation and disposal commands already queued for this batch win
+            // before readiness is dispatched to a descriptor.
+            this.DrainCommandsAndResignal();
+
+            for (int index = 0; index < count; index++)
+            {
+                PtyReactorEvent reactorEvent = this.events[index];
+                if (reactorEvent.Token == WakeToken || reactorEvent.Token == TimerToken)
+                {
+                    continue;
+                }
+
+                if (this.activeContexts.TryGetValue(reactorEvent.Token, out PtyIoContext? context)
+                    && context.ActiveToken == reactorEvent.Token)
+                {
+                    this.DispatchReadyOnReactor(context, reactorEvent.Events);
+                }
+                else if (this.activeProcesses.TryGetValue(
+                    reactorEvent.Token,
+                    out PtyProcessState? process)
+                    && process.HasReactorToken(reactorEvent.Token))
+                {
+                    this.ProcessExitReady(process, reactorEvent.Token);
+                }
+            }
+
+            if (timerFired)
+            {
+                this.ScanFallbackProcesses();
+            }
         }
 
         private bool IsStopped => Volatile.Read(ref this.fatalError) != null;
@@ -367,7 +412,7 @@ namespace Porta.Pty.Linux
                     // Signal before publishing while holding the same gate used by the
                     // consumer. If signaling fails, no command can run after its caller
                     // has observed failure and possibly closed or reused the descriptor.
-                    int error = pty_reactor_wake(this.wakeFd);
+                    int error = this.backend.Wake();
                     if (error != 0)
                     {
                         throw CreateIOException("Waking the PTY epoll reactor", error);
@@ -386,80 +431,13 @@ namespace Porta.Pty.Linux
                 {
                     this.DrainCommandsAndResignal();
 
-                    int error = pty_reactor_wait(
-                        this.epollFd,
-                        this.events,
-                        EventCapacity,
-                        out int count);
+                    int error = this.backend.Wait(this.events, EventCapacity, out int count);
                     if (error != 0)
                     {
                         throw CreateIOException("Waiting for PTY readiness", error);
                     }
 
-                    bool wakeReady = false;
-                    bool timerFired = false;
-                    for (int index = 0; index < count; index++)
-                    {
-                        ulong token = this.events[index].Token;
-                        if (token == WakeToken)
-                        {
-                            wakeReady = true;
-                        }
-                        else if (token == TimerToken)
-                        {
-                            timerFired = true;
-                        }
-                    }
-
-                    if (wakeReady)
-                    {
-                        error = pty_reactor_drain(this.wakeFd);
-                        if (error != 0)
-                        {
-                            throw CreateIOException("Draining the PTY reactor wakeup", error);
-                        }
-                    }
-
-                    if (timerFired)
-                    {
-                        this.fallbackTimerArmed = false;
-                        error = pty_reactor_drain(this.timerFd);
-                        if (error != 0)
-                        {
-                            throw CreateIOException("Draining the PTY fallback poll timer", error);
-                        }
-                    }
-
-                    // Cancellation and disposal commands already queued for this batch win
-                    // before readiness is dispatched to a descriptor.
-                    this.DrainCommandsAndResignal();
-
-                    for (int index = 0; index < count; index++)
-                    {
-                        PtyReactorEvent reactorEvent = this.events[index];
-                        if (reactorEvent.Token == WakeToken || reactorEvent.Token == TimerToken)
-                        {
-                            continue;
-                        }
-
-                        if (this.activeContexts.TryGetValue(reactorEvent.Token, out PtyIoContext? context)
-                            && context.ActiveToken == reactorEvent.Token)
-                        {
-                            this.DispatchReadyOnReactor(context, reactorEvent.Events);
-                        }
-                        else if (this.activeProcesses.TryGetValue(
-                            reactorEvent.Token,
-                            out PtyProcessState? process)
-                            && process.HasReactorToken(reactorEvent.Token))
-                        {
-                            this.ProcessExitReady(process, reactorEvent.Token);
-                        }
-                    }
-
-                    if (timerFired)
-                    {
-                        this.ScanFallbackProcesses();
-                    }
+                    this.ProcessReadyBatch(count);
                 }
             }
             catch (Exception exception)
@@ -531,9 +509,7 @@ namespace Porta.Pty.Linux
             finally
             {
                 NativeMemory.Free(this.events);
-                _ = pty_close(this.timerFd);
-                _ = pty_close(this.wakeFd);
-                _ = pty_close(this.epollFd);
+                this.backend.Close();
             }
         }
 
@@ -612,7 +588,7 @@ namespace Porta.Pty.Linux
 
             if (commandsRemain)
             {
-                int error = pty_reactor_wake(this.wakeFd);
+                int error = this.backend.Wake();
                 if (error != 0)
                 {
                     throw CreateIOException("Rescheduling PTY reactor commands", error);
@@ -692,7 +668,7 @@ namespace Porta.Pty.Linux
 
         private void ArmFallbackTimer(int milliseconds)
         {
-            int error = pty_reactor_set_timer(this.timerFd, milliseconds);
+            int error = this.backend.ArmTimer(milliseconds);
             if (error != 0)
             {
                 // A reactor that cannot arm its poll timer must die so the death fan-out
@@ -712,12 +688,7 @@ namespace Porta.Pty.Linux
                 return;
             }
 
-            int error = pty_reactor_control(
-                this.epollFd,
-                ReactorDelete,
-                context.FileDescriptor,
-                token,
-                0);
+            int error = this.backend.RemoveInterest(context.FileDescriptor, token);
 
             this.activeContexts.Remove(token);
             context.ActiveToken = 0;
@@ -738,12 +709,7 @@ namespace Porta.Pty.Linux
                     token,
                     pidFd =>
                     {
-                        int error = pty_reactor_control(
-                            this.epollFd,
-                            ReactorDelete,
-                            pidFd,
-                            token,
-                            0);
+                        int error = this.backend.RemoveInterest(pidFd, token);
                         if (error != 0 && error != ENOENT)
                         {
                             // A pidfd left registered would keep spinning the reactor,
@@ -758,12 +724,7 @@ namespace Porta.Pty.Linux
 
             failure = process.DetachAfterReapingFromReactor(
                 token,
-                pidFd => _ = pty_reactor_control(
-                    this.epollFd,
-                    ReactorDelete,
-                    pidFd,
-                    token,
-                    0),
+                pidFd => _ = this.backend.RemoveInterest(pidFd, token),
                 failure);
             this.activeProcesses.Remove(token);
             this.processes.Remove(process);
