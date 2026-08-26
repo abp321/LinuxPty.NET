@@ -891,11 +891,6 @@ static int perform_child_handshake(
         return send_error;
     }
 
-    /* A delivered pidfd makes the parent's abort recycle-proof without a hold. */
-    if (message.status == PTY_CONTROL_STATUS_PIDFD) {
-        return 0;
-    }
-
     return receive_release_message(control_fd);
 }
 
@@ -1100,8 +1095,9 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
         }
     }
 
-    if (error == 0 && message.status == PTY_CONTROL_STATUS_NO_PIDFD) {
-        /* Only this branch needs the hold: abort here can kill by PID alone. */
+    if (error == 0) {
+        /* The release fence proves the child is still parked pre-exec whenever
+         * an abort path must fall back to the numeric PID. */
         error = send_release_message(descriptors[0]);
         if (error == EPIPE || error == ECONNRESET) {
             /* The child endpoint is gone, so the child may already be reaped. */
