@@ -22,6 +22,9 @@ namespace Porta.Pty.Linux
         private const int MaxBytesPerDispatch = 64 * 1024;
         private const int MaxCallsPerDispatch = 16;
         private const int MaxWriteSize = 16 * 1024;
+        private const int InlineFree = 0;
+        private const int InlineHeld = 1;
+        private const int InlineStopped = 2;
 
         private readonly EpollReactor reactor;
         private readonly Lock stoppedReactorGate = new();
@@ -31,6 +34,10 @@ namespace Porta.Pty.Linux
         private WriteOperation? writesHead;
         private WriteOperation? writesTail;
         private int accepting = 1;
+        private int readOpsInFlight;
+        private int writeOpsInFlight;
+        private int readInlineOwner;
+        private int writeInlineOwner;
         private int readCloseRequested;
         private int writeCloseRequested;
         private int stopRequested;
@@ -76,10 +83,31 @@ namespace Porta.Pty.Linux
                 return ValueTask.FromException<int>(this.CreateUnavailableException());
             }
 
+            if (Volatile.Read(ref this.readCloseRequested) != 0)
+            {
+                return ValueTask.FromException<int>(new ObjectDisposedException("PtyStream"));
+            }
+
+            // The slot is claimed before the count so the reactor gate already excludes this
+            // caller's syscall; a count above 1 means someone is queued, so the slot goes back
+            // and this read takes its place at the tail.
+            bool inlineClaimed =
+                Interlocked.CompareExchange(ref this.readInlineOwner, InlineHeld, InlineFree) == InlineFree;
+            if (Interlocked.Increment(ref this.readOpsInFlight) == 1 && inlineClaimed)
+            {
+                return this.ReadInline(buffer, cancellationToken);
+            }
+
+            if (inlineClaimed)
+            {
+                Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
+                this.KickReadsOnReactor();
+            }
+
             var operation = new ReadOperation(this, buffer, cancellationToken);
-            operation.RegisterCancellation();
             try
             {
+                operation.RegisterCancellation();
                 this.reactor.PostContextCommand(this, () => this.EnqueueReadOnReactor(operation));
             }
             catch (Exception exception)
@@ -104,10 +132,28 @@ namespace Porta.Pty.Linux
                 return ValueTask.FromException(this.CreateUnavailableException());
             }
 
+            if (Volatile.Read(ref this.writeCloseRequested) != 0)
+            {
+                return ValueTask.FromException(new ObjectDisposedException("PtyStream"));
+            }
+
+            bool inlineClaimed =
+                Interlocked.CompareExchange(ref this.writeInlineOwner, InlineHeld, InlineFree) == InlineFree;
+            if (Interlocked.Increment(ref this.writeOpsInFlight) == 1 && inlineClaimed)
+            {
+                return this.WriteInline(buffer, cancellationToken);
+            }
+
+            if (inlineClaimed)
+            {
+                Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
+                this.KickWritesOnReactor();
+            }
+
             var operation = new WriteOperation(this, buffer, cancellationToken);
-            operation.RegisterCancellation();
             try
             {
+                operation.RegisterCancellation();
                 this.reactor.PostContextCommand(this, () => this.EnqueueWriteOnReactor(operation));
             }
             catch (Exception exception)
@@ -150,6 +196,7 @@ namespace Porta.Pty.Linux
                 }
 
                 Interlocked.Exchange(ref this.stopRequested, 1);
+                this.PoisonInlineOwners();
                 this.stopTask = this.reactor.StopAsync(this);
                 return this.stopTask;
             }
@@ -375,8 +422,321 @@ namespace Porta.Pty.Linux
             }
         }
 
+        private void PoisonInlineOwners()
+        {
+            // The master fd is closed only after StopAsync completes, so no inline syscall may
+            // still be running when this returns. A holder gives the slot up within one
+            // nonblocking syscall of accepting going 0.
+            var readSpin = default(SpinWait);
+            while (Interlocked.CompareExchange(ref this.readInlineOwner, InlineStopped, InlineFree) == InlineHeld)
+            {
+                readSpin.SpinOnce();
+            }
+
+            var writeSpin = default(SpinWait);
+            while (Interlocked.CompareExchange(ref this.writeInlineOwner, InlineStopped, InlineFree) == InlineHeld)
+            {
+                writeSpin.SpinOnce();
+            }
+        }
+
+        private ValueTask<int> ReadInline(Memory<byte> buffer, CancellationToken cancellationToken)
+        {
+            int offset = 0;
+            while (true)
+            {
+                if (Volatile.Read(ref this.accepting) == 0)
+                {
+                    if (offset > 0)
+                    {
+                        return this.CompleteReadInline(offset);
+                    }
+
+                    this.ReleaseReadInline();
+                    return ValueTask.FromException<int>(this.CreateUnavailableException());
+                }
+
+                if (Volatile.Read(ref this.readCloseRequested) != 0)
+                {
+                    if (offset > 0)
+                    {
+                        return this.CompleteReadInline(offset);
+                    }
+
+                    this.ReleaseReadInline();
+                    return ValueTask.FromException<int>(new ObjectDisposedException("PtyStream"));
+                }
+
+                int error;
+                int transferred;
+                try
+                {
+                    error = this.Read(buffer.Slice(offset), buffer.Length - offset, out transferred);
+                }
+                catch (Exception exception)
+                {
+                    if (offset > 0)
+                    {
+                        return this.CompleteReadInline(offset);
+                    }
+
+                    this.ReleaseReadInline();
+                    return ValueTask.FromException<int>(exception);
+                }
+
+                if (error == 0)
+                {
+                    offset += transferred;
+
+                    // A zero transfer is EOF for this caller only; endOfFile is reactor-owned.
+                    if (transferred == 0 || offset == buffer.Length)
+                    {
+                        return this.CompleteReadInline(offset);
+                    }
+
+                    continue;
+                }
+
+                if (offset > 0)
+                {
+                    return this.CompleteReadInline(offset);
+                }
+
+                var operation = new ReadOperation(this, buffer, cancellationToken);
+                try
+                {
+                    operation.RegisterCancellation();
+                    this.reactor.PostContextCommand(this, () => this.EnqueueReadFallbackOnReactor(operation));
+                }
+                catch (Exception exception)
+                {
+                    Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
+                    operation.CompleteException(exception);
+                    this.KickReadsOnReactor();
+                }
+
+                return new ValueTask<int>(operation, operation.Version);
+            }
+        }
+
+        private ValueTask WriteInline(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
+        {
+            int offset = 0;
+            while (true)
+            {
+                if (Volatile.Read(ref this.accepting) == 0)
+                {
+                    this.ReleaseWriteInline();
+                    return ValueTask.FromException(this.CreateUnavailableException());
+                }
+
+                if (Volatile.Read(ref this.writeCloseRequested) != 0)
+                {
+                    this.ReleaseWriteInline();
+                    return ValueTask.FromException(new ObjectDisposedException("PtyStream"));
+                }
+
+                int error;
+                int transferred;
+                try
+                {
+                    error = this.Write(
+                        buffer.Slice(offset),
+                        Math.Min(buffer.Length - offset, MaxWriteSize),
+                        out transferred);
+                }
+                catch (Exception exception)
+                {
+                    this.ReleaseWriteInline();
+                    return ValueTask.FromException(exception);
+                }
+
+                if (error == 0 && transferred > 0)
+                {
+                    offset += transferred;
+                    if (offset == buffer.Length)
+                    {
+                        return this.CompleteWriteInline();
+                    }
+
+                    continue;
+                }
+
+                // The reactor write loop owns error classification and its hangup knowledge.
+                var operation = new WriteOperation(this, buffer, cancellationToken) { Offset = offset };
+                try
+                {
+                    operation.RegisterCancellation();
+                    this.reactor.PostContextCommand(this, () => this.EnqueueWriteFallbackOnReactor(operation));
+                }
+                catch (Exception exception)
+                {
+                    Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
+                    operation.CompleteException(exception);
+                    this.KickWritesOnReactor();
+                }
+
+                return new ValueTask(operation, operation.Version);
+            }
+        }
+
+        private ValueTask<int> CompleteReadInline(int result)
+        {
+            Interlocked.Decrement(ref this.readOpsInFlight);
+            Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
+            this.KickReadsOnReactor();
+            return new ValueTask<int>(result);
+        }
+
+        private ValueTask CompleteWriteInline()
+        {
+            Interlocked.Decrement(ref this.writeOpsInFlight);
+            Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
+            this.KickWritesOnReactor();
+            return ValueTask.CompletedTask;
+        }
+
+        private void ReleaseReadInline()
+        {
+            Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
+            Interlocked.Decrement(ref this.readOpsInFlight);
+            this.KickReadsOnReactor();
+        }
+
+        private void ReleaseWriteInline()
+        {
+            Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
+            Interlocked.Decrement(ref this.writeOpsInFlight);
+            this.KickWritesOnReactor();
+        }
+
+        private void KickReadsOnReactor()
+        {
+            // Decrement before release before this check: a racing caller either claims the
+            // slot afterwards or is already counted here, so no parked operation is stranded.
+            if (Volatile.Read(ref this.readOpsInFlight) == 0)
+            {
+                return;
+            }
+
+            try
+            {
+                this.reactor.PostContextCommand(this, () =>
+                {
+                    this.ProcessReadsOnReactor(0);
+                    this.UpdateInterestOnReactor();
+                });
+            }
+            catch
+            {
+                // A stopped reactor already fails parked operations.
+            }
+        }
+
+        private void KickWritesOnReactor()
+        {
+            if (Volatile.Read(ref this.writeOpsInFlight) == 0)
+            {
+                return;
+            }
+
+            try
+            {
+                this.reactor.PostContextCommand(this, () =>
+                {
+                    this.ProcessWritesOnReactor(0);
+                    this.UpdateInterestOnReactor();
+                });
+            }
+            catch
+            {
+                // A stopped reactor already fails parked operations.
+            }
+        }
+
+        private void EnqueueReadFallbackOnReactor(ReadOperation operation)
+        {
+            Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
+            if (!operation.IsCompleted)
+            {
+                if (operation.IsCancellationRequested)
+                {
+                    operation.CompleteCanceled();
+                }
+                else if (this.stoppedOnReactor)
+                {
+                    operation.CompleteException(this.CreateUnavailableException());
+                }
+                else if (Volatile.Read(ref this.stopRequested) != 0)
+                {
+                    operation.CompleteException(new ObjectDisposedException("PtyConnection"));
+                }
+                else if (Volatile.Read(ref this.readCloseRequested) != 0 || this.readClosedOnReactor)
+                {
+                    operation.CompleteException(new ObjectDisposedException("PtyStream"));
+                }
+                else if (this.readError is { } failure)
+                {
+                    operation.CompleteException(failure);
+                }
+                else if (this.endOfFile)
+                {
+                    operation.CompleteResult(0);
+                }
+                else
+                {
+                    // Stagers appended behind while the inline slot was held, but this
+                    // operation was issued first.
+                    this.AddReadFirst(operation);
+                }
+            }
+
+            this.ProcessReadsOnReactor(0);
+            this.UpdateInterestOnReactor();
+        }
+
+        private void EnqueueWriteFallbackOnReactor(WriteOperation operation)
+        {
+            Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
+            if (!operation.IsCompleted)
+            {
+                if (operation.IsCancellationRequested)
+                {
+                    operation.CompleteCanceled();
+                }
+                else if (this.stoppedOnReactor)
+                {
+                    operation.CompleteException(this.CreateUnavailableException());
+                }
+                else if (Volatile.Read(ref this.stopRequested) != 0)
+                {
+                    operation.CompleteException(new ObjectDisposedException("PtyConnection"));
+                }
+                else if (Volatile.Read(ref this.writeCloseRequested) != 0 || this.writeClosedOnReactor)
+                {
+                    operation.CompleteException(new ObjectDisposedException("PtyStream"));
+                }
+                else if (this.writeError is { } failure)
+                {
+                    operation.CompleteException(failure);
+                }
+                else
+                {
+                    this.AddWriteFirst(operation);
+                }
+            }
+
+            this.ProcessWritesOnReactor(0);
+            this.UpdateInterestOnReactor();
+        }
+
         private void ProcessReadsOnReactor(uint events)
         {
+            if (Volatile.Read(ref this.readInlineOwner) != InlineFree)
+            {
+                return;
+            }
+
             int bytesProcessed = 0;
             int calls = 0;
             while (this.readsHead is { } operation
@@ -505,6 +865,11 @@ namespace Porta.Pty.Linux
 
         private void ProcessWritesOnReactor(uint events)
         {
+            if (Volatile.Read(ref this.writeInlineOwner) != InlineFree)
+            {
+                return;
+            }
+
             int bytesProcessed = 0;
             int calls = 0;
             while (this.writesHead is { } operation
@@ -588,6 +953,7 @@ namespace Porta.Pty.Linux
             uint interest = 0;
             if (Volatile.Read(ref this.stopRequested) == 0
                 && Volatile.Read(ref this.readCloseRequested) == 0
+                && Volatile.Read(ref this.readInlineOwner) == InlineFree
                 && this.readsHead is not null
                 && this.readError == null
                 && !this.endOfFile)
@@ -597,6 +963,7 @@ namespace Porta.Pty.Linux
 
             if (Volatile.Read(ref this.stopRequested) == 0
                 && Volatile.Read(ref this.writeCloseRequested) == 0
+                && Volatile.Read(ref this.writeInlineOwner) == InlineFree
                 && this.writesHead is not null
                 && this.writeError == null)
             {
@@ -644,6 +1011,38 @@ namespace Porta.Pty.Linux
             }
 
             this.readsTail = operation;
+            operation.IsQueued = true;
+        }
+
+        private void AddReadFirst(ReadOperation operation)
+        {
+            operation.Next = this.readsHead;
+            if (this.readsHead is null)
+            {
+                this.readsTail = operation;
+            }
+            else
+            {
+                this.readsHead.Previous = operation;
+            }
+
+            this.readsHead = operation;
+            operation.IsQueued = true;
+        }
+
+        private void AddWriteFirst(WriteOperation operation)
+        {
+            operation.Next = this.writesHead;
+            if (this.writesHead is null)
+            {
+                this.writesTail = operation;
+            }
+            else
+            {
+                this.writesHead.Previous = operation;
+            }
+
+            this.writesHead = operation;
             operation.IsQueued = true;
         }
 
@@ -832,11 +1231,14 @@ namespace Porta.Pty.Linux
                     return false;
                 }
 
+                this.OnCompletionClaimed();
                 registration = this.TryTakeRegistration() ? this.cancellationRegistration : default;
                 return true;
             }
 
             protected abstract void RequestCancellation();
+
+            protected abstract void OnCompletionClaimed();
 
             private bool TryTakeRegistration()
             {
@@ -924,6 +1326,11 @@ namespace Porta.Pty.Linux
             {
                 this.Context.RequestCancellation(this);
             }
+
+            protected override void OnCompletionClaimed()
+            {
+                Interlocked.Decrement(ref this.Context.readOpsInFlight);
+            }
         }
 
         private sealed class WriteOperation : IoOperation, IValueTaskSource
@@ -996,6 +1403,11 @@ namespace Porta.Pty.Linux
             protected override void RequestCancellation()
             {
                 this.Context.RequestCancellation(this);
+            }
+
+            protected override void OnCompletionClaimed()
+            {
+                Interlocked.Decrement(ref this.Context.writeOpsInFlight);
             }
         }
     }
