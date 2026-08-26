@@ -509,6 +509,27 @@ namespace Porta.Pty.Linux
         {
             if (!process.TryReap(out int exitCode, out Exception? failure))
             {
+                // The pidfd is level-triggered, so a readable but not-yet-reapable child
+                // (one still held by a tracer) would spin the reactor on every wait.
+                process.UseFallbackAfterDeclinedReap(
+                    token,
+                    pidFd =>
+                    {
+                        int error = pty_reactor_control(
+                            this.epollFd,
+                            ReactorDelete,
+                            pidFd,
+                            token,
+                            0);
+                        if (error != 0 && error != ENOENT)
+                        {
+                            // A pidfd left registered would keep spinning the reactor,
+                            // so fail it and let every child fall back instead.
+                            throw CreateIOException("Removing PTY pidfd epoll interest", error);
+                        }
+                    });
+                this.activeProcesses.Remove(token);
+                this.processes.Remove(process);
                 return;
             }
 

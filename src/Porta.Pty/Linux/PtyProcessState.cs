@@ -192,6 +192,33 @@ namespace Porta.Pty.Linux
             }
         }
 
+        internal void UseFallbackAfterDeclinedReap(ulong token, Action<int> unregister)
+        {
+            lock (this.reapGate)
+            {
+                if (this.lifetimeState != LifetimeState.Epoll || this.activeToken != token)
+                {
+                    return;
+                }
+
+                // Deregister only. The fallback still passes the pidfd to pty_wait_child,
+                // so closing it stays with the reaping paths.
+                unregister(this.pidFileDescriptor);
+                this.activeToken = 0;
+                this.lifetimeState = LifetimeState.Unowned;
+            }
+
+            try
+            {
+                this.RegisterFallback();
+            }
+            catch
+            {
+                _ = this.SendSignal(SIGKILL);
+                _ = this.EnsureReapedAsync();
+            }
+        }
+
         internal bool TryReap(out int exitCode, out Exception? failure)
         {
             lock (this.reapGate)
@@ -302,6 +329,18 @@ namespace Porta.Pty.Linux
                 if (this.lifetimeState != LifetimeState.Unowned)
                 {
                     return this.exitCompletion.Task;
+                }
+
+                try
+                {
+                    // The process-wide poller reaps non-blockingly; the spawn worker is
+                    // the only thread that can run a spawn, so it must not block here.
+                    this.RegisterFallback();
+                    return this.exitCompletion.Task;
+                }
+                catch
+                {
+                    // Fall through to the blocking claim below.
                 }
 
                 // Claim reaping only after every signal operation that was already
