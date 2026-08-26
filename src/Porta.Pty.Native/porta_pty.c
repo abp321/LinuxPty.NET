@@ -185,23 +185,6 @@ static int configure_master(int master_fd)
         result = fcntl(master_fd, F_SETFL, status_flags | O_NONBLOCK);
     } while (result == -1 && errno == EINTR);
 
-    if (result == -1) {
-        return errno;
-    }
-
-    int descriptor_flags;
-    do {
-        descriptor_flags = fcntl(master_fd, F_GETFD);
-    } while (descriptor_flags == -1 && errno == EINTR);
-
-    if (descriptor_flags == -1) {
-        return errno;
-    }
-
-    do {
-        result = fcntl(master_fd, F_SETFD, descriptor_flags | FD_CLOEXEC);
-    } while (result == -1 && errno == EINTR);
-
     return result == -1 ? errno : 0;
 }
 

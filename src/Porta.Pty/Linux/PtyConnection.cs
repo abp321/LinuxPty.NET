@@ -64,7 +64,7 @@ namespace Porta.Pty.Linux
                 // handler is invoked here instead of never being called at all.
                 if (replay)
                 {
-                    this.InvokeExitHandlers([value!], exitCode);
+                    this.InvokeExitHandlers(value!.GetInvocationList(), exitCode);
                 }
             }
 

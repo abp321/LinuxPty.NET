@@ -25,24 +25,34 @@ namespace Porta.Pty
             PtyOptions options,
             CancellationToken cancellationToken)
         {
-            if (string.IsNullOrEmpty(options.App))
+            // Validation runs against the snapshot, not the caller's instance, so concurrent
+            // mutation cannot slip unchecked values past these guards.
+            string app = options.App;
+            string cwd = options.Cwd;
+            int rows = options.Rows;
+            int cols = options.Cols;
+            string[] commandLine = options.CommandLine;
+            IDictionary<string, string> environment = options.Environment;
+
+            if (string.IsNullOrEmpty(app))
             {
                 throw new ArgumentNullException(nameof(options.App));
             }
 
-            if (string.IsNullOrEmpty(options.Cwd))
+            if (string.IsNullOrEmpty(cwd))
             {
                 throw new ArgumentNullException(nameof(options.Cwd));
             }
 
-            if (options.CommandLine == null)
+            if (commandLine == null)
             {
                 throw new ArgumentNullException(nameof(options.CommandLine));
             }
 
-            for (int i = 0; i < options.CommandLine.Length; i++)
+            string[] commandLineSnapshot = (string[])commandLine.Clone();
+            for (int i = 0; i < commandLineSnapshot.Length; i++)
             {
-                string argument = options.CommandLine[i];
+                string argument = commandLineSnapshot[i];
                 if (argument is null)
                 {
                     throw new ArgumentException(
@@ -58,17 +68,27 @@ namespace Porta.Pty
                 }
             }
 
-            ArgumentOutOfRangeException.ThrowIfNegative(options.Rows, nameof(options.Rows));
-            ArgumentOutOfRangeException.ThrowIfGreaterThan(options.Rows, ushort.MaxValue, nameof(options.Rows));
-            ArgumentOutOfRangeException.ThrowIfNegative(options.Cols, nameof(options.Cols));
-            ArgumentOutOfRangeException.ThrowIfGreaterThan(options.Cols, ushort.MaxValue, nameof(options.Cols));
+            ArgumentOutOfRangeException.ThrowIfNegative(rows, nameof(options.Rows));
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(rows, ushort.MaxValue, nameof(options.Rows));
+            ArgumentOutOfRangeException.ThrowIfNegative(cols, nameof(options.Cols));
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(cols, ushort.MaxValue, nameof(options.Cols));
 
-            if (options.Environment == null)
+            if (environment == null)
             {
                 throw new ArgumentNullException(nameof(options.Environment));
             }
 
-            foreach (KeyValuePair<string, string> pair in options.Environment)
+            var preparedOptions = new PtyOptions
+            {
+                App = app,
+                Cwd = cwd,
+                Rows = rows,
+                Cols = cols,
+                CommandLine = commandLineSnapshot,
+                Environment = new Dictionary<string, string>(environment, StringComparer.Ordinal),
+            };
+
+            foreach (KeyValuePair<string, string> pair in preparedOptions.Environment)
             {
                 if (pair.Key.Length == 0)
                 {
@@ -96,18 +116,6 @@ namespace Porta.Pty
             {
                 throw new PlatformNotSupportedException("LinuxPty.NET supports Linux only.");
             }
-
-            var preparedOptions = new PtyOptions
-            {
-                App = options.App,
-                Cwd = options.Cwd,
-                Rows = options.Rows,
-                Cols = options.Cols,
-                CommandLine = (string[])options.CommandLine.Clone(),
-                Environment = new Dictionary<string, string>(
-                    options.Environment,
-                    StringComparer.Ordinal),
-            };
 
             return Linux.PtySpawnQueue.Shared.Enqueue(preparedOptions, cancellationToken);
         }
