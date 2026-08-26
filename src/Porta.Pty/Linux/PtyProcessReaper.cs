@@ -8,7 +8,8 @@ namespace Porta.Pty.Linux
     using System.Threading;
 
     /// <summary>
-    /// Process-wide fallback for kernels where pidfds are unavailable.
+    /// Emergency reaper used only when the reactor cannot own fallback polling (reactor death,
+    /// construction failure, or timer-arm failure). Created lazily, never in normal operation.
     /// </summary>
     internal sealed class PtyProcessReaper
     {

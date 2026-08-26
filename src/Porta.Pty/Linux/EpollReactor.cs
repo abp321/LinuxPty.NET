@@ -22,6 +22,9 @@ namespace Porta.Pty.Linux
         private const int EventCapacity = 64;
         private const int MaxCommandsPerDrain = 16;
         private const int ENOENT = 2;
+        private const int FallbackBasePollMilliseconds = 20;
+        private const int FallbackMaxPollMilliseconds = 500;
+        private const int FallbackPollGrowthFactor = 2;
 
         private static readonly Lock SharedGate = new();
         private static EpollReactor? shared;
@@ -35,9 +38,12 @@ namespace Porta.Pty.Linux
         private readonly Dictionary<ulong, PtyProcessState> activeProcesses = new();
         private readonly HashSet<PtyIoContext> contexts = new();
         private readonly HashSet<PtyProcessState> processes = new();
+        private readonly HashSet<PtyProcessState> fallbackProcesses = new();
         private readonly unsafe PtyReactorEvent* events;
         private readonly Thread thread;
         private long nextToken;
+        private int fallbackPollIntervalMilliseconds = FallbackBasePollMilliseconds;
+        private bool fallbackRegistered;
         private Exception? fatalError;
 
         private unsafe EpollReactor()
@@ -183,6 +189,38 @@ namespace Porta.Pty.Linux
             });
 
             return completion.Task;
+        }
+
+        /// <summary>
+        /// Adopts a child that has no usable pidfd into the reactor's timerfd poll.
+        /// </summary>
+        internal void RegisterFallbackProcess(PtyProcessState process)
+        {
+            this.Post(() =>
+            {
+                if (this.IsStopped)
+                {
+                    // The death fan-out suppresses exceptions from abandoned commands, so a
+                    // throwing emergency registration would strand the child unreaped.
+                    try
+                    {
+                        PtyProcessReaper.Shared.Register(process);
+                    }
+                    catch
+                    {
+                        process.AbandonFallbackForEmergencyReap();
+                    }
+
+                    return;
+                }
+
+                if (this.fallbackProcesses.Add(process))
+                {
+                    this.fallbackRegistered = true;
+                    this.fallbackPollIntervalMilliseconds = FallbackBasePollMilliseconds;
+                    this.ArmFallbackTimer(FallbackBasePollMilliseconds);
+                }
+            });
         }
 
         internal void PostContextCommand(PtyIoContext context, Action action)
@@ -347,12 +385,17 @@ namespace Porta.Pty.Linux
                     }
 
                     bool wakeReady = false;
+                    bool timerFired = false;
                     for (int index = 0; index < count; index++)
                     {
-                        if (this.events[index].Token == WakeToken)
+                        ulong token = this.events[index].Token;
+                        if (token == WakeToken)
                         {
                             wakeReady = true;
-                            break;
+                        }
+                        else if (token == TimerToken)
+                        {
+                            timerFired = true;
                         }
                     }
 
@@ -365,6 +408,15 @@ namespace Porta.Pty.Linux
                         }
                     }
 
+                    if (timerFired)
+                    {
+                        error = pty_reactor_drain(this.timerFd);
+                        if (error != 0)
+                        {
+                            throw CreateIOException("Draining the PTY fallback poll timer", error);
+                        }
+                    }
+
                     // Cancellation and disposal commands already queued for this batch win
                     // before readiness is dispatched to a descriptor.
                     this.DrainCommandsAndResignal();
@@ -372,7 +424,7 @@ namespace Porta.Pty.Linux
                     for (int index = 0; index < count; index++)
                     {
                         PtyReactorEvent reactorEvent = this.events[index];
-                        if (reactorEvent.Token == WakeToken)
+                        if (reactorEvent.Token == WakeToken || reactorEvent.Token == TimerToken)
                         {
                             continue;
                         }
@@ -389,6 +441,11 @@ namespace Porta.Pty.Linux
                         {
                             this.ProcessExitReady(process, reactorEvent.Token);
                         }
+                    }
+
+                    if (timerFired)
+                    {
+                        this.ScanFallbackProcesses();
                     }
                 }
             }
@@ -416,10 +473,13 @@ namespace Porta.Pty.Linux
                 this.contexts.CopyTo(failedContexts);
                 PtyProcessState[] failedProcesses = new PtyProcessState[this.processes.Count];
                 this.processes.CopyTo(failedProcesses);
+                PtyProcessState[] fallbackChildren = new PtyProcessState[this.fallbackProcesses.Count];
+                this.fallbackProcesses.CopyTo(fallbackChildren);
                 this.activeContexts.Clear();
                 this.contexts.Clear();
                 this.activeProcesses.Clear();
                 this.processes.Clear();
+                this.fallbackProcesses.Clear();
 
                 foreach (PtyIoContext context in failedContexts)
                 {
@@ -429,6 +489,18 @@ namespace Porta.Pty.Linux
                 foreach (PtyProcessState process in failedProcesses)
                 {
                     process.UseFallbackAfterReactorFailure();
+                }
+
+                foreach (PtyProcessState child in fallbackChildren)
+                {
+                    try
+                    {
+                        PtyProcessReaper.Shared.Register(child);
+                    }
+                    catch
+                    {
+                        child.AbandonFallbackForEmergencyReap();
+                    }
                 }
 
                 foreach (ReactorCommand command in abandonedCommands)
@@ -535,6 +607,48 @@ namespace Porta.Pty.Linux
             }
         }
 
+        private void ScanFallbackProcesses()
+        {
+            var reaped = new List<FallbackReapResult>();
+            foreach (PtyProcessState process in this.fallbackProcesses)
+            {
+                if (process.TryReap(out int exitCode, out Exception? failure))
+                {
+                    reaped.Add(new FallbackReapResult(process, exitCode, failure));
+                }
+            }
+
+            foreach (FallbackReapResult result in reaped)
+            {
+                this.fallbackProcesses.Remove(result.Process);
+                result.Process.FinishReapingFromFallback(result.ExitCode, result.Failure);
+            }
+
+            // A registration during this scan already reset the interval; growing now would undo it.
+            this.fallbackPollIntervalMilliseconds = reaped.Count != 0 || this.fallbackRegistered
+                ? FallbackBasePollMilliseconds
+                : Math.Min(
+                    this.fallbackPollIntervalMilliseconds * FallbackPollGrowthFactor,
+                    FallbackMaxPollMilliseconds);
+            this.fallbackRegistered = false;
+
+            if (this.fallbackProcesses.Count != 0)
+            {
+                this.ArmFallbackTimer(this.fallbackPollIntervalMilliseconds);
+            }
+        }
+
+        private void ArmFallbackTimer(int milliseconds)
+        {
+            int error = pty_reactor_set_timer(this.timerFd, milliseconds);
+            if (error != 0)
+            {
+                // A reactor that cannot arm its poll timer must die so the death fan-out
+                // rehomes every fallback child.
+                throw CreateIOException("Arming the PTY fallback poll timer", error);
+            }
+        }
+
         private void Deactivate(PtyIoContext context, bool ignoreErrors)
         {
             ulong token = context.ActiveToken;
@@ -614,5 +728,10 @@ namespace Porta.Pty.Linux
         }
 
         private readonly record struct ReactorCommand(PtyIoContext? Context, Action Action);
+
+        private readonly record struct FallbackReapResult(
+            PtyProcessState Process,
+            int ExitCode,
+            Exception? Failure);
     }
 }

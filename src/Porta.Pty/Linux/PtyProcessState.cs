@@ -223,6 +223,22 @@ namespace Porta.Pty.Linux
             }
         }
 
+        internal void AbandonFallbackForEmergencyReap()
+        {
+            lock (this.reapGate)
+            {
+                if (this.lifetimeState != LifetimeState.Fallback)
+                {
+                    return;
+                }
+
+                this.lifetimeState = LifetimeState.Unowned;
+            }
+
+            _ = this.SendSignal(SIGKILL);
+            _ = this.EnsureReapedAsync();
+        }
+
         internal bool TryReap(out int exitCode, out Exception? failure)
         {
             lock (this.reapGate)
@@ -429,7 +445,15 @@ namespace Porta.Pty.Linux
                 this.lifetimeState = LifetimeState.RegisteringFallback;
                 try
                 {
-                    PtyProcessReaper.Shared.Register(this);
+                    try
+                    {
+                        EpollReactor.Shared.RegisterFallbackProcess(this);
+                    }
+                    catch
+                    {
+                        PtyProcessReaper.Shared.Register(this);
+                    }
+
                     this.lifetimeState = LifetimeState.Fallback;
                 }
                 catch
