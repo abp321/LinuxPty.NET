@@ -169,25 +169,6 @@ static int pidfd_support_error;
 
 extern char** environ;
 
-static int configure_master(int master_fd)
-{
-    int status_flags;
-    do {
-        status_flags = fcntl(master_fd, F_GETFL);
-    } while (status_flags == -1 && errno == EINTR);
-
-    if (status_flags == -1) {
-        return errno;
-    }
-
-    int result;
-    do {
-        result = fcntl(master_fd, F_SETFL, status_flags | O_NONBLOCK);
-    } while (result == -1 && errno == EINTR);
-
-    return result == -1 ? errno : 0;
-}
-
 static int open_pid_fd(pid_t pid)
 {
 #ifdef SYS_pidfd_open
@@ -312,16 +293,9 @@ static pty_wait_result_t wait_for_child(
     return result;
 }
 
+/* Entries are borrowed, so only the pointer vector is owned here. */
 static void free_environment(char** environment)
 {
-    if (environment == NULL) {
-        return;
-    }
-
-    for (size_t index = 0; environment[index] != NULL; index++) {
-        free(environment[index]);
-    }
-
     free(environment);
 }
 
@@ -339,7 +313,6 @@ static void remove_environment_key(
             continue;
         }
 
-        free(environment[index]);
         (*count)--;
         memmove(
             &environment[index],
@@ -348,7 +321,7 @@ static void remove_environment_key(
     }
 }
 
-static int apply_environment_entry(
+static void apply_environment_entry(
     char** environment,
     size_t* count,
     const char* entry,
@@ -356,24 +329,18 @@ static int apply_environment_entry(
 {
     const char* separator = strchr(entry, '=');
     if (separator == NULL || separator == entry) {
-        return 0;
+        return;
     }
 
     size_t key_length = (size_t)(separator - entry);
     remove_environment_key(environment, count, entry, key_length);
     if (empty_means_unset && separator[1] == '\0') {
-        return 0;
+        return;
     }
 
-    char* copied_entry = strdup(entry);
-    if (copied_entry == NULL) {
-        return ENOMEM;
-    }
-
-    environment[*count] = copied_entry;
+    environment[*count] = (char*)(uintptr_t)entry;
     (*count)++;
     environment[*count] = NULL;
-    return 0;
 }
 
 static int prepare_environment(
@@ -412,34 +379,23 @@ static int prepare_environment(
     }
 
     size_t count = 0;
-    int error = 0;
     // Inherited keys are already unique on the managed side, so appending
     // directly avoids an O(n^2) rescan per entry before fork.
-    for (size_t index = 0; error == 0 && index < inherited_count; index++) {
+    // Entries are borrowed, never copied: the caller's strings outlive
+    // pty_spawn and the forked child reads its copy-on-write view until exec.
+    for (size_t index = 0; index < inherited_count; index++) {
         const char* entry = inherited_environment[index];
         const char* separator = strchr(entry, '=');
         if (separator == NULL || separator == entry) {
             continue;
         }
 
-        char* copied_entry = strdup(entry);
-        if (copied_entry == NULL) {
-            error = ENOMEM;
-            break;
-        }
-
-        environment[count] = copied_entry;
+        environment[count] = (char*)(uintptr_t)entry;
         count++;
         environment[count] = NULL;
     }
 
-    if (error == 0) {
-        error = apply_environment_entry(
-            environment,
-            &count,
-            "TERM=xterm-256color",
-            0);
-    }
+    apply_environment_entry(environment, &count, "TERM=xterm-256color", 0);
     const char* fixed_unsets[] = {
         "TMUX",
         "TMUX_PANE",
@@ -451,7 +407,7 @@ static int prepare_environment(
         "LINES",
     };
     for (size_t index = 0;
-        error == 0 && index < sizeof(fixed_unsets) / sizeof(fixed_unsets[0]);
+        index < sizeof(fixed_unsets) / sizeof(fixed_unsets[0]);
         index++) {
         remove_environment_key(
             environment,
@@ -461,18 +417,9 @@ static int prepare_environment(
     }
 
     for (size_t index = 0;
-        error == 0 && mutations != NULL && mutations[index] != NULL;
+        mutations != NULL && mutations[index] != NULL;
         index++) {
-        error = apply_environment_entry(
-            environment,
-            &count,
-            mutations[index],
-            1);
-    }
-
-    if (error != 0) {
-        free_environment(environment);
-        return error;
+        apply_environment_entry(environment, &count, mutations[index], 1);
     }
 
     *environment_out = environment;
@@ -543,7 +490,7 @@ static int open_pty_pair(
 
     int master_fd;
     do {
-        master_fd = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+        master_fd = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC | O_NONBLOCK);
     } while (master_fd == -1 && errno == EINTR);
 
     if (master_fd == -1) {
@@ -944,6 +891,11 @@ static int perform_child_handshake(
         return send_error;
     }
 
+    /* A delivered pidfd makes the parent's abort recycle-proof without a hold. */
+    if (message.status == PTY_CONTROL_STATUS_PIDFD) {
+        return 0;
+    }
+
     return receive_release_message(control_fd);
 }
 
@@ -1148,11 +1100,8 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
         }
     }
 
-    if (error == 0) {
-        error = configure_master(master_fd);
-    }
-
-    if (error == 0) {
+    if (error == 0 && message.status == PTY_CONTROL_STATUS_NO_PIDFD) {
+        /* Only this branch needs the hold: abort here can kill by PID alone. */
         error = send_release_message(descriptors[0]);
         if (error == EPIPE || error == ECONNRESET) {
             /* The child endpoint is gone, so the child may already be reaped. */
