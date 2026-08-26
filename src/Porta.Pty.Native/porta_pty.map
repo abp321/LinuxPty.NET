@@ -2,6 +2,7 @@
     global:
         pty_close;
         pty_cleanup_untracked;
+        pty_eventfd_create;
         pty_io_read;
         pty_io_write;
         pty_kill;
@@ -14,6 +15,7 @@
         pty_reactor_wake;
         pty_resize;
         pty_spawn;
+        pty_timerfd_create;
         pty_wait_child;
 
     local:

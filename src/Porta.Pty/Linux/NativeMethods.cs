@@ -150,6 +150,12 @@ namespace Porta.Pty.Linux
             out int timerFd);
 
         [LibraryImport(LibPortaPty)]
+        internal static partial int pty_eventfd_create(out int fd);
+
+        [LibraryImport(LibPortaPty)]
+        internal static partial int pty_timerfd_create(out int fd);
+
+        [LibraryImport(LibPortaPty)]
         internal static partial int pty_reactor_control(
             int epollFd,
             int operation,

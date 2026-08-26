@@ -1237,6 +1237,48 @@ PTY_EXPORT int pty_reactor_create(
     return 0;
 }
 
+PTY_EXPORT int pty_eventfd_create(int* fd_out)
+{
+    if (fd_out == NULL) {
+        return EINVAL;
+    }
+
+    *fd_out = -1;
+
+    int fd;
+    do {
+        fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    } while (fd == -1 && errno == EINTR);
+
+    if (fd == -1) {
+        return errno;
+    }
+
+    *fd_out = fd;
+    return 0;
+}
+
+PTY_EXPORT int pty_timerfd_create(int* fd_out)
+{
+    if (fd_out == NULL) {
+        return EINVAL;
+    }
+
+    *fd_out = -1;
+
+    int fd;
+    do {
+        fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    } while (fd == -1 && errno == EINTR);
+
+    if (fd == -1) {
+        return errno;
+    }
+
+    *fd_out = fd;
+    return 0;
+}
+
 PTY_EXPORT int pty_reactor_control(
     int epoll_fd,
     int operation,

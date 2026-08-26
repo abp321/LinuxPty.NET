@@ -39,7 +39,8 @@ namespace Porta.Pty.Linux
         private readonly HashSet<PtyProcessState> processes = new();
         private readonly List<PtyProcessState> fallbackProcesses = new();
         private readonly unsafe PtyReactorEvent* events;
-        private readonly Thread thread;
+        private readonly Thread? thread;
+        private readonly bool isExternal;
         private long nextToken;
         private int fallbackPollIntervalMilliseconds = FallbackBasePollMilliseconds;
         private int fallbackScanCursor;
@@ -68,6 +69,16 @@ namespace Porta.Pty.Linux
                 backend.Close();
                 throw;
             }
+        }
+
+        /// <summary>
+        /// Creates an engine driven by a caller-supplied event loop: no reactor thread, no event
+        /// buffer, and no <see cref="Run"/> loop, so every entry arrives through the backend.
+        /// </summary>
+        internal EpollReactor(IPtyEventLoop eventLoop)
+        {
+            this.isExternal = true;
+            this.backend = new ExternalReactorBackend(this, eventLoop);
         }
 
         internal static EpollReactor Shared
@@ -246,6 +257,7 @@ namespace Porta.Pty.Linux
                         this.Deactivate(context, ignoreErrors: true);
                         this.contexts.Remove(context);
                         context.StopOnReactor();
+                        this.CloseExternalBackendIfIdle();
                     }
                     finally
                     {
@@ -383,7 +395,65 @@ namespace Porta.Pty.Linux
             }
         }
 
-        private bool IsStopped => Volatile.Read(ref this.fatalError) != null;
+        /// <summary>
+        /// Drains queued commands on behalf of the external loop's wake descriptor.
+        /// </summary>
+        internal void ExternalWake()
+        {
+            this.RunExternalEntry(this.DrainCommandsAndResignal);
+        }
+
+        /// <summary>
+        /// Dispatches one external readiness delivery for <paramref name="token"/>.
+        /// </summary>
+        internal void ExternalReadiness(ulong token, uint nativeEvents)
+        {
+            this.RunExternalEntry(() =>
+            {
+                // Cancellation and disposal commands win before readiness is dispatched to a
+                // descriptor, exactly as the batch loop orders them.
+                this.DrainCommandsAndResignal();
+
+                if (this.activeContexts.TryGetValue(token, out PtyIoContext? context)
+                    && context.ActiveToken == token)
+                {
+                    this.DispatchReadyOnReactor(context, nativeEvents);
+                }
+                else if (this.activeProcesses.TryGetValue(token, out PtyProcessState? process)
+                    && process.HasReactorToken(token))
+                {
+                    this.ProcessExitReady(process, token);
+                }
+            });
+        }
+
+        /// <summary>
+        /// Runs the fallback reap scan on behalf of the external loop's timer descriptor.
+        /// </summary>
+        internal void ExternalTimer()
+        {
+            this.RunExternalEntry(() =>
+            {
+                this.DrainCommandsAndResignal();
+                this.fallbackTimerArmed = false;
+                this.ScanFallbackProcesses();
+            });
+        }
+
+        /// <summary>
+        /// Fails the engine from the external backend, once: a stopped engine ignores it.
+        /// </summary>
+        internal void ExternalFail(Exception exception)
+        {
+            if (this.IsStopped)
+            {
+                return;
+            }
+
+            this.FailReactor(exception);
+        }
+
+        internal bool IsStopped => Volatile.Read(ref this.fatalError) != null;
 
         private static TaskCompletionSource<object?> CreateCompletionSource()
         {
@@ -442,14 +512,27 @@ namespace Porta.Pty.Linux
             }
             catch (Exception exception)
             {
-                ReactorCommand[] abandonedCommands;
-                lock (this.commandGate)
-                {
-                    this.fatalError = exception;
-                    abandonedCommands = this.commands.ToArray();
-                    this.commands.Clear();
-                }
+                this.FailReactor(exception);
+            }
+            finally
+            {
+                NativeMemory.Free(this.events);
+                this.backend.Close();
+            }
+        }
 
+        private void FailReactor(Exception exception)
+        {
+            ReactorCommand[] abandonedCommands;
+            lock (this.commandGate)
+            {
+                this.fatalError = exception;
+                abandonedCommands = this.commands.ToArray();
+                this.commands.Clear();
+            }
+
+            if (!this.isExternal)
+            {
                 // Uncache before the failure fan-out so callers racing the fault get a
                 // fresh reactor instead of this one, which now rejects every post.
                 lock (SharedGate)
@@ -459,57 +542,99 @@ namespace Porta.Pty.Linux
                         shared = null;
                     }
                 }
+            }
 
-                PtyIoContext[] failedContexts = new PtyIoContext[this.contexts.Count];
-                this.contexts.CopyTo(failedContexts);
-                PtyProcessState[] failedProcesses = new PtyProcessState[this.processes.Count];
-                this.processes.CopyTo(failedProcesses);
-                PtyProcessState[] fallbackChildren = new PtyProcessState[this.fallbackProcesses.Count];
-                this.fallbackProcesses.CopyTo(fallbackChildren);
-                this.activeContexts.Clear();
-                this.contexts.Clear();
-                this.activeProcesses.Clear();
-                this.processes.Clear();
-                this.fallbackProcesses.Clear();
+            PtyIoContext[] failedContexts = new PtyIoContext[this.contexts.Count];
+            this.contexts.CopyTo(failedContexts);
+            PtyProcessState[] failedProcesses = new PtyProcessState[this.processes.Count];
+            this.processes.CopyTo(failedProcesses);
+            PtyProcessState[] fallbackChildren = new PtyProcessState[this.fallbackProcesses.Count];
+            this.fallbackProcesses.CopyTo(fallbackChildren);
+            this.activeContexts.Clear();
+            this.contexts.Clear();
+            this.activeProcesses.Clear();
+            this.processes.Clear();
+            this.fallbackProcesses.Clear();
 
-                foreach (PtyIoContext context in failedContexts)
+            foreach (PtyIoContext context in failedContexts)
+            {
+                context.FailAfterReactorStopped(exception);
+            }
+
+            foreach (PtyProcessState process in failedProcesses)
+            {
+                process.UseFallbackAfterReactorFailure();
+            }
+
+            foreach (PtyProcessState child in fallbackChildren)
+            {
+                try
                 {
-                    context.FailAfterReactorStopped(exception);
+                    PtyProcessReaper.Shared.Register(child);
                 }
-
-                foreach (PtyProcessState process in failedProcesses)
+                catch
                 {
-                    process.UseFallbackAfterReactorFailure();
-                }
-
-                foreach (PtyProcessState child in fallbackChildren)
-                {
-                    try
-                    {
-                        PtyProcessReaper.Shared.Register(child);
-                    }
-                    catch
-                    {
-                        child.AbandonFallbackForEmergencyReap();
-                    }
-                }
-
-                foreach (ReactorCommand command in abandonedCommands)
-                {
-                    try
-                    {
-                        this.Execute(command);
-                    }
-                    catch
-                    {
-                        // Contexts have already been failed; no operation may remain pending.
-                    }
+                    child.AbandonFallbackForEmergencyReap();
                 }
             }
-            finally
+
+            foreach (ReactorCommand command in abandonedCommands)
             {
-                NativeMemory.Free(this.events);
+                try
+                {
+                    this.Execute(command);
+                }
+                catch
+                {
+                    // Contexts have already been failed; no operation may remain pending.
+                }
+            }
+
+            if (this.isExternal)
+            {
+                // No Run loop reaches a finally here, so releasing the caller's loop is this
+                // method's job in external mode.
                 this.backend.Close();
+            }
+        }
+
+        private void CloseExternalBackendIfIdle()
+        {
+            if (!this.isExternal
+                || this.contexts.Count != 0
+                || this.processes.Count != 0
+                || this.activeContexts.Count != 0
+                || this.activeProcesses.Count != 0
+                || this.fallbackProcesses.Count != 0)
+            {
+                return;
+            }
+
+            // The connection's descriptor close is gated on StopAsync's task and reaping completes
+            // through ProcessExitReady or the fallback scan, so once every set is empty no further
+            // callback is owed and the caller's loop can be released.
+            lock (this.commandGate)
+            {
+                this.fatalError ??= new IOException("The PTY epoll reactor has stopped.");
+            }
+
+            this.backend.Close();
+        }
+
+        private void RunExternalEntry(Action entry)
+        {
+            if (this.IsStopped)
+            {
+                return;
+            }
+
+            try
+            {
+                entry();
+            }
+            catch (Exception exception)
+            {
+                this.FailReactor(exception);
             }
         }
 
@@ -663,7 +788,10 @@ namespace Porta.Pty.Linux
             if (this.fallbackProcesses.Count != 0)
             {
                 this.ArmFallbackTimer(this.fallbackPollIntervalMilliseconds);
+                return;
             }
+
+            this.CloseExternalBackendIfIdle();
         }
 
         private void ArmFallbackTimer(int milliseconds)
@@ -719,6 +847,7 @@ namespace Porta.Pty.Linux
                     });
                 this.activeProcesses.Remove(token);
                 this.processes.Remove(process);
+                this.CloseExternalBackendIfIdle();
                 return;
             }
 
@@ -729,6 +858,7 @@ namespace Porta.Pty.Linux
             this.activeProcesses.Remove(token);
             this.processes.Remove(process);
             process.CompleteReaping(exitCode, failure);
+            this.CloseExternalBackendIfIdle();
         }
 
         private ulong AllocateToken()
