@@ -72,7 +72,7 @@ Console.WriteLine(Encoding.UTF8.GetString(buffer, 0, count));
 
 ## Behavior notes
 
-**Spawning.** `SpawnAsync` validates a snapshot of the options, then queues the inherently synchronous native spawn on one dedicated process-wide worker, so it never blocks its caller or a ThreadPool thread. Cancellation is observed before queued work begins; cancellation during native process creation completes only after the resulting child has been killed, its master descriptor closed, and the child reaped.
+**Spawning.** `SpawnAsync` validates a snapshot of the options, then runs the inherently synchronous native spawn on a transient thread-pool worker under a process-wide gate that covers only the native section, so spawns serialize without a dedicated thread and never block the caller. Cancellation is observed before queued work begins; cancellation during native process creation completes only after the resulting child has been killed, its master descriptor closed, and the child reaped.
 
 **Environment.** The child inherits the managed process environment captured immediately before the native spawn (`Environment.GetEnvironmentVariables()`), not libc's potentially stale `environ`. The native shim then sets `TERM=xterm-256color` and unsets `TMUX`, `TMUX_PANE`, `STY`, `WINDOW`, `WINDOWID`, `TERMCAP`, `COLUMNS`, and `LINES`. Entries from `PtyOptions.Environment` are applied last, so they can override anything, including `TERM`; an empty value means unset. Executable lookup uses the resulting effective `PATH`, including one changed through `PtyOptions.Environment`.
 
