@@ -4,7 +4,6 @@
 namespace Porta.Pty.Linux
 {
     using System;
-    using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.ComponentModel;
     using System.IO;
@@ -27,7 +26,7 @@ namespace Porta.Pty.Linux
 
         private readonly int epollFd;
         private readonly int wakeFd;
-        private readonly ConcurrentQueue<Action> commands = new();
+        private readonly Queue<ReactorCommand> commands = new();
         private readonly Lock commandGate = new();
         private readonly Dictionary<ulong, PtyIoContext> activeContexts = new();
         private readonly Dictionary<ulong, PtyProcessState> activeProcesses = new();
@@ -173,7 +172,7 @@ namespace Porta.Pty.Linux
 
         internal void PostContextCommand(PtyIoContext context, Action action)
         {
-            this.Post(() => this.ExecuteContextAction(context, action));
+            this.Post(new ReactorCommand(context, action));
         }
 
         internal Task CloseSideAsync(PtyIoContext context, bool readSide)
@@ -288,6 +287,11 @@ namespace Porta.Pty.Linux
 
         private void Post(Action command)
         {
+            this.Post(new ReactorCommand(null, command));
+        }
+
+        private void Post(ReactorCommand command)
+        {
             lock (this.commandGate)
             {
                 if (this.fatalError is { } failure)
@@ -295,13 +299,19 @@ namespace Porta.Pty.Linux
                     throw new IOException("The PTY epoll reactor has stopped.", failure);
                 }
 
-                // Signal before publishing while holding the same gate used by the
-                // consumer. If signaling fails, no command can run after its caller
-                // has observed failure and possibly closed or reused the descriptor.
-                int error = pty_reactor_wake(this.wakeFd);
-                if (error != 0)
+                // An undrained command under this gate has not been dequeued yet, and the
+                // drain re-signals under the same gate for anything it leaves behind, so
+                // the reactor is already guaranteed to observe this one.
+                if (this.commands.Count == 0)
                 {
-                    throw CreateIOException("Waking the PTY epoll reactor", error);
+                    // Signal before publishing while holding the same gate used by the
+                    // consumer. If signaling fails, no command can run after its caller
+                    // has observed failure and possibly closed or reused the descriptor.
+                    int error = pty_reactor_wake(this.wakeFd);
+                    if (error != 0)
+                    {
+                        throw CreateIOException("Waking the PTY epoll reactor", error);
+                    }
                 }
 
                 this.commands.Enqueue(command);
@@ -360,9 +370,7 @@ namespace Porta.Pty.Linux
                         if (this.activeContexts.TryGetValue(reactorEvent.Token, out PtyIoContext? context)
                             && context.ActiveToken == reactorEvent.Token)
                         {
-                            this.ExecuteContextAction(
-                                context,
-                                () => context.ProcessReadyOnReactor(reactorEvent.Events));
+                            this.DispatchReadyOnReactor(context, reactorEvent.Events);
                         }
                         else if (this.activeProcesses.TryGetValue(
                             reactorEvent.Token,
@@ -376,17 +384,22 @@ namespace Porta.Pty.Linux
             }
             catch (Exception exception)
             {
-                Action[] abandonedCommands;
+                ReactorCommand[] abandonedCommands;
                 lock (this.commandGate)
                 {
                     this.fatalError = exception;
-                    var commands = new List<Action>();
-                    while (this.commands.TryDequeue(out Action? command))
-                    {
-                        commands.Add(command);
-                    }
+                    abandonedCommands = this.commands.ToArray();
+                    this.commands.Clear();
+                }
 
-                    abandonedCommands = commands.ToArray();
+                // Uncache before the failure fan-out so callers racing the fault get a
+                // fresh reactor instead of this one, which now rejects every post.
+                lock (SharedGate)
+                {
+                    if (ReferenceEquals(shared, this))
+                    {
+                        shared = null;
+                    }
                 }
 
                 PtyIoContext[] failedContexts = new PtyIoContext[this.contexts.Count];
@@ -408,11 +421,11 @@ namespace Porta.Pty.Linux
                     process.UseFallbackAfterReactorFailure();
                 }
 
-                foreach (Action command in abandonedCommands)
+                foreach (ReactorCommand command in abandonedCommands)
                 {
                     try
                     {
-                        command();
+                        this.Execute(command);
                     }
                     catch
                     {
@@ -424,6 +437,36 @@ namespace Porta.Pty.Linux
             {
                 _ = pty_close(this.wakeFd);
                 _ = pty_close(this.epollFd);
+            }
+        }
+
+        private void Execute(ReactorCommand command)
+        {
+            if (command.Context is { } context)
+            {
+                this.ExecuteContextAction(context, command.Action);
+                return;
+            }
+
+            command.Action();
+        }
+
+        private void DispatchReadyOnReactor(PtyIoContext context, uint events)
+        {
+            if (context.IsStoppedOnReactor)
+            {
+                context.ProcessReadyOnReactor(events);
+                return;
+            }
+
+            try
+            {
+                context.ProcessReadyOnReactor(events);
+            }
+            catch (Exception exception)
+            {
+                this.Deactivate(context, ignoreErrors: true);
+                context.FailOnReactor(exception);
             }
         }
 
@@ -451,7 +494,7 @@ namespace Porta.Pty.Linux
             int processed = 0;
             while (processed < MaxCommandsPerDrain)
             {
-                Action? command;
+                ReactorCommand command;
                 lock (this.commandGate)
                 {
                     if (!this.commands.TryDequeue(out command))
@@ -460,14 +503,14 @@ namespace Porta.Pty.Linux
                     }
                 }
 
-                command();
+                this.Execute(command);
                 processed++;
             }
 
             bool commandsRemain;
             lock (this.commandGate)
             {
-                commandsRemain = !this.commands.IsEmpty;
+                commandsRemain = this.commands.Count != 0;
             }
 
             if (commandsRemain)
@@ -558,5 +601,7 @@ namespace Porta.Pty.Linux
 
             return token;
         }
+
+        private readonly record struct ReactorCommand(PtyIoContext? Context, Action Action);
     }
 }
