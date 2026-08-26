@@ -484,6 +484,40 @@ namespace Porta.Pty.Linux
                     return ValueTask.FromException<int>(exception);
                 }
 
+                if (error == EAGAIN && offset == 0)
+                {
+                    // Bounded pre-yield spin: a streaming writer refills within microseconds and
+                    // re-arming epoll costs far more than the spin; once the spin would yield,
+                    // the reactor parks the read.
+                    var spin = new SpinWait();
+                    while (error == EAGAIN && !spin.NextSpinWillYield)
+                    {
+                        spin.SpinOnce();
+
+                        if (Volatile.Read(ref this.accepting) == 0)
+                        {
+                            this.ReleaseReadInline();
+                            return ValueTask.FromException<int>(this.CreateUnavailableException());
+                        }
+
+                        if (Volatile.Read(ref this.readCloseRequested) != 0)
+                        {
+                            this.ReleaseReadInline();
+                            return ValueTask.FromException<int>(new ObjectDisposedException("PtyStream"));
+                        }
+
+                        try
+                        {
+                            error = this.Read(buffer, buffer.Length, out transferred);
+                        }
+                        catch (Exception exception)
+                        {
+                            this.ReleaseReadInline();
+                            return ValueTask.FromException<int>(exception);
+                        }
+                    }
+                }
+
                 if (error == 0)
                 {
                     offset += transferred;
