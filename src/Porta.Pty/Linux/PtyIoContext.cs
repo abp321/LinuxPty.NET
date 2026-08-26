@@ -23,7 +23,7 @@ namespace Porta.Pty.Linux
         private const int MaxCallsPerDispatch = 16;
 
         // A parked operation completes at this much so one busy descriptor cannot hold the reactor for a full 64 KB fill while a small ready read waits; the consumer's next read drains the rest inline.
-        private const int ReactorFillQuantum = 16 * 1024;
+        private const int ReactorFillQuantum = 8 * 1024;
 
         private const int MaxWriteSize = 16 * 1024;
         private const int InlineFree = 0;
@@ -500,46 +500,6 @@ namespace Porta.Pty.Linux
 
                     this.ReleaseReadInline();
                     return ValueTask.FromException<int>(exception);
-                }
-
-                if (error == EAGAIN && offset == 0)
-                {
-                    // Bounded pre-yield spin: a streaming writer refills within microseconds and
-                    // re-arming epoll costs far more than the spin; once the spin would yield,
-                    // the reactor parks the read.
-                    var spin = new SpinWait();
-                    while (error == EAGAIN && !spin.NextSpinWillYield)
-                    {
-                        spin.SpinOnce();
-
-                        if (Volatile.Read(ref this.accepting) == 0)
-                        {
-                            this.ReleaseReadInline();
-                            return ValueTask.FromException<int>(this.CreateUnavailableException());
-                        }
-
-                        if (Volatile.Read(ref this.readCloseRequested) != 0)
-                        {
-                            this.ReleaseReadInline();
-                            return ValueTask.FromException<int>(new ObjectDisposedException("PtyStream"));
-                        }
-
-                        if (cancellationToken.IsCancellationRequested)
-                        {
-                            this.ReleaseReadInline();
-                            return ValueTask.FromCanceled<int>(cancellationToken);
-                        }
-
-                        try
-                        {
-                            error = this.Read(buffer, buffer.Length, out transferred);
-                        }
-                        catch (Exception exception)
-                        {
-                            this.ReleaseReadInline();
-                            return ValueTask.FromException<int>(exception);
-                        }
-                    }
                 }
 
                 if (error == 0)
