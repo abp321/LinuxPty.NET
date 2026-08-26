@@ -4,6 +4,8 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>Porta.Pty</RootNamespace>
+    <!-- Assembly simple name differs from the namespace so this fork and upstream Porta.Pty can load side by side in one process. -->
+    <AssemblyName>LinuxPty.NET</AssemblyName>
     <PackageId>LinuxPty.NET</PackageId>
     <Title>LinuxPty.NET</Title>
     <Description>Linux-only pseudoterminal library for .NET 10, derived from Porta.Pty.</Description>

@@ -205,7 +205,7 @@ jobs:
           for required in \
             README.md \
             LICENSE \
-            lib/net10.0/Porta.Pty.dll \
+            lib/net10.0/LinuxPty.NET.dll \
             runtimes/linux-x64/native/libporta_pty.so \
             runtimes/linux-arm64/native/libporta_pty.so
           do
