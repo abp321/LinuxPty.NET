@@ -1,7 +1,7 @@
 /*
  * porta_pty.c - Native PTY shim for Porta.Pty
  *
- * This library keeps forkpty() and execvp() entirely in native code so no
+ * This library keeps fork() and execvp() entirely in native code so no
  * managed .NET code runs in the forked child process.
  *
  * On the pidfd-capable path the forked child opens its own pidfd and hands it
@@ -12,6 +12,11 @@
  * Copyright (c) Microsoft Corporation. All rights reserved.
  * Licensed under the MIT license.
  */
+
+/* ptsname_r is a glibc extension guarded by __USE_GNU. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
 #include <errno.h>
 #include <fcntl.h>
@@ -31,6 +36,7 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+#include <utmp.h>
 
 #define PTY_EXPORT __attribute__((visibility("default")))
 
@@ -48,6 +54,9 @@
 #endif
 #ifndef SYS_pidfd_open
 #define SYS_pidfd_open 434
+#endif
+#ifndef SYS_close_range
+#define SYS_close_range 436
 #endif
 #endif
 
@@ -477,7 +486,7 @@ static void initialize_terminal_settings(struct termios* term)
 {
     memset(term, 0, sizeof(*term));
     term->c_iflag = ICRNL | IXON | IXANY | IMAXBEL | BRKINT | IUTF8;
-    term->c_oflag = 0;
+    term->c_oflag = OPOST | ONLCR;
     term->c_cflag = CREAD | CS8 | HUPCL;
     term->c_lflag = ICANON | ISIG | IEXTEN | ECHO | ECHOE | ECHOK
         | ECHOKE | ECHOCTL;
@@ -501,6 +510,149 @@ static void initialize_terminal_settings(struct termios* term)
     cfsetospeed(term, B38400);
 }
 
+static int reserve_control_descriptor(int* descriptor)
+{
+    /* login_tty() in the child dup2()s the slave onto 0, 1 and 2. */
+    if (*descriptor >= 3) {
+        return 0;
+    }
+
+    int reserved;
+    do {
+        reserved = fcntl(*descriptor, F_DUPFD_CLOEXEC, 3);
+    } while (reserved == -1 && errno == EINTR);
+
+    if (reserved == -1) {
+        return errno;
+    }
+
+    close(*descriptor);
+    *descriptor = reserved;
+    return 0;
+}
+
+/*
+ * openpty() creates both ends without O_CLOEXEC, so an unrelated fork+exec
+ * elsewhere in the host process inherits the master for its whole lifetime.
+ */
+static int open_pty_pair(
+    int* master_out,
+    int* slave_out,
+    const struct termios* term,
+    const struct winsize* window_size)
+{
+    *master_out = -1;
+    *slave_out = -1;
+
+    int master_fd;
+    do {
+        master_fd = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+    } while (master_fd == -1 && errno == EINTR);
+
+    if (master_fd == -1) {
+        return errno;
+    }
+
+    char slave_name[PATH_MAX];
+    int error = 0;
+    if (grantpt(master_fd) == -1 || unlockpt(master_fd) == -1) {
+        error = errno;
+    } else {
+        error = ptsname_r(master_fd, slave_name, sizeof(slave_name));
+    }
+
+    if (error != 0) {
+        close(master_fd);
+        return error;
+    }
+
+    int slave_fd;
+    do {
+        slave_fd = open(slave_name, O_RDWR | O_NOCTTY | O_CLOEXEC);
+    } while (slave_fd == -1 && errno == EINTR);
+
+    if (slave_fd == -1) {
+        error = errno;
+        close(master_fd);
+        return error;
+    }
+
+    /* login_tty's dup2 is a no-op on a matching fd, leaving FD_CLOEXEC set. */
+    error = reserve_control_descriptor(&slave_fd);
+    if (error != 0) {
+        close(slave_fd);
+        close(master_fd);
+        return error;
+    }
+
+    int result;
+    do {
+        result = tcsetattr(slave_fd, TCSAFLUSH, term);
+    } while (result == -1 && errno == EINTR);
+
+    if (result == 0) {
+        do {
+            result = ioctl(slave_fd, TIOCSWINSZ, window_size);
+        } while (result == -1 && errno == EINTR);
+    }
+
+    if (result == -1) {
+        error = errno;
+        close(slave_fd);
+        close(master_fd);
+        return error;
+    }
+
+    *master_out = master_fd;
+    *slave_out = slave_fd;
+    return 0;
+}
+
+/*
+ * Runs in the forked child. exec resets caught signals but preserves SIG_IGN,
+ * so without this the host's ignored dispositions (the .NET runtime ignores
+ * SIGPIPE) leak into the terminal and everything it later spawns.
+ */
+static void reset_child_signals(void)
+{
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = SIG_DFL;
+    sigemptyset(&action.sa_mask);
+
+    for (int signal_number = 1; signal_number < NSIG; signal_number++) {
+        (void)sigaction(signal_number, &action, NULL);
+    }
+
+    sigset_t empty;
+    sigemptyset(&empty);
+    (void)sigprocmask(SIG_SETMASK, &empty, NULL);
+}
+
+/* Runs in the forked child, after every descriptor it still needs is wired. */
+static void close_inherited_descriptors(void)
+{
+#ifdef SYS_close_range
+    int result;
+    do {
+        result = (int)syscall(SYS_close_range, 3U, ~0U, 0U);
+    } while (result == -1 && errno == EINTR);
+
+    if (result == 0) {
+        return;
+    }
+#endif
+
+    long limit = sysconf(_SC_OPEN_MAX);
+    if (limit < 0) {
+        limit = 4096;
+    }
+
+    for (int descriptor = 3; descriptor < (int)limit; descriptor++) {
+        (void)close(descriptor);
+    }
+}
+
 static int send_pid_fd_signal(int pid_fd, int signal_number)
 {
 #ifdef SYS_pidfd_send_signal
@@ -521,27 +673,6 @@ static int send_pid_fd_signal(int pid_fd, int signal_number)
     errno = ENOSYS;
     return -1;
 #endif
-}
-
-static int reserve_control_descriptor(int* descriptor)
-{
-    /* login_tty() inside forkpty dup2()s the slave onto 0, 1 and 2. */
-    if (*descriptor >= 3) {
-        return 0;
-    }
-
-    int reserved;
-    do {
-        reserved = fcntl(*descriptor, F_DUPFD_CLOEXEC, 3);
-    } while (reserved == -1 && errno == EINTR);
-
-    if (reserved == -1) {
-        return errno;
-    }
-
-    close(*descriptor);
-    *descriptor = reserved;
-    return 0;
 }
 
 static int create_control_channel(int descriptors[2])
@@ -894,10 +1025,23 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
         return result;
     }
 
-    pid_t pid = forkpty(&master_fd, NULL, &term, &window_size);
+    int slave_fd = -1;
+    int pty_error = open_pty_pair(&master_fd, &slave_fd, &term, &window_size);
+    if (pty_error != 0) {
+        close(descriptors[0]);
+        close(descriptors[1]);
+        pthread_mutex_unlock(&pty_spawn_lock);
+        free_environment(child_environment);
+        result.error = pty_error;
+        return result;
+    }
+
+    pid_t pid = fork();
     int spawn_errno = errno;
 
     if (pid == -1) {
+        close(slave_fd);
+        close(master_fd);
         close(descriptors[0]);
         close(descriptors[1]);
         pthread_mutex_unlock(&pty_spawn_lock);
@@ -907,6 +1051,12 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
     }
 
     if (pid == 0) {
+        close(master_fd);
+        /* login_tty's dup2 onto 0, 1 and 2 clears FD_CLOEXEC on the copies. */
+        if (login_tty(slave_fd) == -1) {
+            _exit(errno);
+        }
+
         close(descriptors[0]);
         int handshake_error = perform_child_handshake(
             descriptors[1],
@@ -917,6 +1067,8 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
         }
 
         close(descriptors[1]);
+        close_inherited_descriptors();
+        reset_child_signals();
         environ = child_environment;
         if (working_dir != NULL && working_dir[0] != '\0') {
             if (chdir(working_dir) == -1) {
@@ -927,6 +1079,8 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
         execvp(file, argv);
         _exit(errno);
     }
+
+    close(slave_fd);
 
     /* Closing the parent's copy of the child endpoint makes its EOF visible. */
     close(descriptors[1]);
