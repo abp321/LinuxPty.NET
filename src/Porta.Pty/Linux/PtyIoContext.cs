@@ -30,12 +30,6 @@ namespace Porta.Pty.Linux
         private const int InlineHeld = 1;
         private const int InlineStopped = 2;
 
-        // Bounds how long a synchronously completing consumer loop can hold a pool worker: every Kth inline completion is delivered asynchronously so the worker re-enters the pool dispatch loop.
-        private const int InlineYieldInterval = 2;
-
-        // An inline read completes at this much rather than filling the caller's whole buffer, so a streaming consumer reaches the yield interval often enough for interactive work to interleave.
-        private const int InlineFillQuantum = 4 * 1024;
-
         private readonly EpollReactor reactor;
         private readonly Lock stoppedReactorGate = new();
         private readonly Lock stopGate = new();
@@ -48,10 +42,6 @@ namespace Porta.Pty.Linux
         private int writeOpsInFlight;
         private int readInlineOwner;
         private int writeInlineOwner;
-
-        // Touched only while the matching inline owner is held, so a single holder by construction: no Interlocked or Volatile needed.
-        private int consecutiveInlineReads;
-        private int consecutiveInlineWrites;
         private int readCloseRequested;
         private int writeCloseRequested;
         private int stopRequested;
@@ -459,217 +449,131 @@ namespace Porta.Pty.Linux
 
         private ValueTask<int> ReadInline(Memory<byte> buffer, CancellationToken cancellationToken)
         {
-            int offset = 0;
-            while (true)
+            if (Volatile.Read(ref this.accepting) == 0)
             {
-                if (Volatile.Read(ref this.accepting) == 0)
-                {
-                    if (offset > 0)
-                    {
-                        return this.CompleteReadInline(offset);
-                    }
-
-                    this.ReleaseReadInline();
-                    return ValueTask.FromException<int>(this.CreateUnavailableException());
-                }
-
-                if (Volatile.Read(ref this.readCloseRequested) != 0)
-                {
-                    if (offset > 0)
-                    {
-                        return this.CompleteReadInline(offset);
-                    }
-
-                    this.ReleaseReadInline();
-                    return ValueTask.FromException<int>(new ObjectDisposedException("PtyStream"));
-                }
-
-                if (cancellationToken.IsCancellationRequested)
-                {
-                    if (offset > 0)
-                    {
-                        return this.CompleteReadInline(offset);
-                    }
-
-                    this.ReleaseReadInline();
-                    return ValueTask.FromCanceled<int>(cancellationToken);
-                }
-
-                int error;
-                int transferred;
-                try
-                {
-                    error = this.Read(buffer.Slice(offset), buffer.Length - offset, out transferred);
-                }
-                catch (Exception exception)
-                {
-                    if (offset > 0)
-                    {
-                        return this.CompleteReadInline(offset);
-                    }
-
-                    this.ReleaseReadInline();
-                    return ValueTask.FromException<int>(exception);
-                }
-
-                if (error == 0)
-                {
-                    offset += transferred;
-
-                    // A zero transfer is EOF for this caller only; endOfFile is reactor-owned.
-                    if (transferred == 0 || offset == buffer.Length || offset >= InlineFillQuantum)
-                    {
-                        return this.CompleteReadInline(offset);
-                    }
-
-                    continue;
-                }
-
-                if (offset > 0)
-                {
-                    return this.CompleteReadInline(offset);
-                }
-
-                this.consecutiveInlineReads = 0;
-                var operation = new ReadOperation(this, buffer, cancellationToken);
-                try
-                {
-                    operation.RegisterCancellation();
-                    this.reactor.PostContextCommand(this, () => this.EnqueueReadFallbackOnReactor(operation));
-                }
-                catch (Exception exception)
-                {
-                    Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
-                    operation.CompleteException(exception);
-                    this.KickReadsOnReactor();
-                }
-
-                return new ValueTask<int>(operation, operation.Version);
+                this.ReleaseReadInline();
+                return ValueTask.FromException<int>(this.CreateUnavailableException());
             }
+
+            if (Volatile.Read(ref this.readCloseRequested) != 0)
+            {
+                this.ReleaseReadInline();
+                return ValueTask.FromException<int>(new ObjectDisposedException("PtyStream"));
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                this.ReleaseReadInline();
+                return ValueTask.FromCanceled<int>(cancellationToken);
+            }
+
+            int error;
+            int transferred;
+            try
+            {
+                error = this.Read(buffer, buffer.Length, out transferred);
+            }
+            catch (Exception exception)
+            {
+                this.ReleaseReadInline();
+                return ValueTask.FromException<int>(exception);
+            }
+
+            if (error == 0)
+            {
+                // A zero transfer is EOF for this caller only; endOfFile is reactor-owned.
+                return this.CompleteReadInline(transferred);
+            }
+
+            var operation = new ReadOperation(this, buffer, cancellationToken);
+            try
+            {
+                operation.RegisterCancellation();
+                this.reactor.PostContextCommand(this, () => this.EnqueueReadFallbackOnReactor(operation));
+            }
+            catch (Exception exception)
+            {
+                Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
+                operation.CompleteException(exception);
+                this.KickReadsOnReactor();
+            }
+
+            return new ValueTask<int>(operation, operation.Version);
         }
 
         private ValueTask WriteInline(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
         {
-            int offset = 0;
-            while (true)
+            if (Volatile.Read(ref this.accepting) == 0)
             {
-                if (Volatile.Read(ref this.accepting) == 0)
-                {
-                    this.ReleaseWriteInline();
-                    return ValueTask.FromException(this.CreateUnavailableException());
-                }
-
-                if (Volatile.Read(ref this.writeCloseRequested) != 0)
-                {
-                    this.ReleaseWriteInline();
-                    return ValueTask.FromException(new ObjectDisposedException("PtyStream"));
-                }
-
-                if (cancellationToken.IsCancellationRequested)
-                {
-                    this.ReleaseWriteInline();
-                    return ValueTask.FromCanceled(cancellationToken);
-                }
-
-                int error;
-                int transferred;
-                try
-                {
-                    error = this.Write(
-                        buffer.Slice(offset),
-                        Math.Min(buffer.Length - offset, MaxWriteSize),
-                        out transferred);
-                }
-                catch (Exception exception)
-                {
-                    this.ReleaseWriteInline();
-                    return ValueTask.FromException(exception);
-                }
-
-                if (error == 0 && transferred > 0)
-                {
-                    offset += transferred;
-                    if (offset == buffer.Length)
-                    {
-                        return this.CompleteWriteInline();
-                    }
-
-                    continue;
-                }
-
-                // The reactor write loop owns error classification and its hangup knowledge.
-                this.consecutiveInlineWrites = 0;
-                var operation = new WriteOperation(this, buffer, cancellationToken) { Offset = offset };
-                try
-                {
-                    operation.RegisterCancellation();
-                    this.reactor.PostContextCommand(this, () => this.EnqueueWriteFallbackOnReactor(operation));
-                }
-                catch (Exception exception)
-                {
-                    Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
-                    operation.CompleteException(exception);
-                    this.KickWritesOnReactor();
-                }
-
-                return new ValueTask(operation, operation.Version);
+                this.ReleaseWriteInline();
+                return ValueTask.FromException(this.CreateUnavailableException());
             }
+
+            if (Volatile.Read(ref this.writeCloseRequested) != 0)
+            {
+                this.ReleaseWriteInline();
+                return ValueTask.FromException(new ObjectDisposedException("PtyStream"));
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                this.ReleaseWriteInline();
+                return ValueTask.FromCanceled(cancellationToken);
+            }
+
+            int error;
+            int transferred;
+            try
+            {
+                error = this.Write(buffer, Math.Min(buffer.Length, MaxWriteSize), out transferred);
+            }
+            catch (Exception exception)
+            {
+                this.ReleaseWriteInline();
+                return ValueTask.FromException(exception);
+            }
+
+            if (error == 0 && transferred == buffer.Length)
+            {
+                return this.CompleteWriteInline();
+            }
+
+            // The reactor write loop owns error classification and its hangup knowledge.
+            int offset = error == 0 && transferred > 0 ? transferred : 0;
+            var operation = new WriteOperation(this, buffer, cancellationToken) { Offset = offset };
+            try
+            {
+                operation.RegisterCancellation();
+                this.reactor.PostContextCommand(this, () => this.EnqueueWriteFallbackOnReactor(operation));
+            }
+            catch (Exception exception)
+            {
+                Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
+                operation.CompleteException(exception);
+                this.KickWritesOnReactor();
+            }
+
+            return new ValueTask(operation, operation.Version);
         }
 
         private ValueTask<int> CompleteReadInline(int result)
         {
-            if (++this.consecutiveInlineReads < InlineYieldInterval)
-            {
-                Interlocked.Decrement(ref this.readOpsInFlight);
-                Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
-                this.KickReadsOnReactor();
-                return new ValueTask<int>(result);
-            }
-
-            this.consecutiveInlineReads = 0;
-
-            // The buffer is unused: the data is already in the caller's buffer. The operation's
-            // OnCompletionClaimed performs the readOpsInFlight decrement, so this path must not.
-            var operation = new ReadOperation(this, default, CancellationToken.None);
+            Interlocked.Decrement(ref this.readOpsInFlight);
             Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
             this.KickReadsOnReactor();
-            ThreadPool.UnsafeQueueUserWorkItem(
-                static state =>
-                {
-                    var (deferred, count) = state;
-                    deferred.CompleteResult(count);
-                },
-                (operation, result),
-                preferLocal: false);
-            return new ValueTask<int>(operation, operation.Version);
+            return new ValueTask<int>(result);
         }
 
         private ValueTask CompleteWriteInline()
         {
-            if (++this.consecutiveInlineWrites < InlineYieldInterval)
-            {
-                Interlocked.Decrement(ref this.writeOpsInFlight);
-                Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
-                this.KickWritesOnReactor();
-                return ValueTask.CompletedTask;
-            }
-
-            this.consecutiveInlineWrites = 0;
-
-            // OnCompletionClaimed performs the writeOpsInFlight decrement, so this path must not.
-            var operation = new WriteOperation(this, default, CancellationToken.None);
+            Interlocked.Decrement(ref this.writeOpsInFlight);
             Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
             this.KickWritesOnReactor();
-            ThreadPool.UnsafeQueueUserWorkItem(
-                static deferred => deferred.CompleteResult(),
-                operation,
-                preferLocal: false);
-            return new ValueTask(operation, operation.Version);
+            return ValueTask.CompletedTask;
         }
 
         private void ReleaseReadInline()
         {
-            this.consecutiveInlineReads = 0;
             Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
             Interlocked.Decrement(ref this.readOpsInFlight);
             this.KickReadsOnReactor();
@@ -677,7 +581,6 @@ namespace Porta.Pty.Linux
 
         private void ReleaseWriteInline()
         {
-            this.consecutiveInlineWrites = 0;
             Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
             Interlocked.Decrement(ref this.writeOpsInFlight);
             this.KickWritesOnReactor();
@@ -818,12 +721,20 @@ namespace Porta.Pty.Linux
                 && Volatile.Read(ref this.stopRequested) == 0
                 && Volatile.Read(ref this.readCloseRequested) == 0)
             {
-                // Canceling a partially filled operation would discard bytes already copied
-                // into the caller's buffer, so only the untouched head can be canceled here.
-                if (operation.IsCancellationRequested && operation.Offset == 0)
+                // Cancellation stops further consumption immediately; bytes already copied into
+                // the caller's buffer are delivered as a short success rather than discarded.
+                if (operation.IsCancellationRequested)
                 {
                     this.RemoveRead(operation);
-                    operation.CompleteCanceled();
+                    if (operation.Offset > 0)
+                    {
+                        operation.CompleteResult(operation.Offset);
+                    }
+                    else
+                    {
+                        operation.CompleteCanceled();
+                    }
+
                     continue;
                 }
 
