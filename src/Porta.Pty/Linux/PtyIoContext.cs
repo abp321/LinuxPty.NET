@@ -385,7 +385,9 @@ namespace Porta.Pty.Linux
                 && Volatile.Read(ref this.stopRequested) == 0
                 && Volatile.Read(ref this.readCloseRequested) == 0)
             {
-                if (operation.IsCancellationRequested)
+                // Canceling a partially filled operation would discard bytes already copied
+                // into the caller's buffer, so only the untouched head can be canceled here.
+                if (operation.IsCancellationRequested && operation.Offset == 0)
                 {
                     this.RemoveRead(operation);
                     operation.CompleteCanceled();
@@ -395,37 +397,52 @@ namespace Porta.Pty.Linux
                 if (this.endOfFile)
                 {
                     this.RemoveRead(operation);
-                    operation.CompleteResult(0);
+                    operation.CompleteResult(operation.Offset);
                     continue;
                 }
 
-                int count = Math.Min(operation.Buffer.Length, MaxBytesPerDispatch - bytesProcessed);
+                int count = Math.Min(
+                    operation.Buffer.Length - operation.Offset,
+                    MaxBytesPerDispatch - bytesProcessed);
                 int error;
                 int transferred;
                 try
                 {
-                    error = this.Read(operation.Buffer, count, out transferred);
+                    error = this.Read(operation.Buffer.Slice(operation.Offset), count, out transferred);
                 }
                 catch (Exception exception)
                 {
                     this.RemoveRead(operation);
-                    operation.CompleteException(exception);
+                    if (operation.Offset > 0)
+                    {
+                        // A persistent failure resurfaces on the next read at offset 0.
+                        operation.CompleteResult(operation.Offset);
+                    }
+                    else
+                    {
+                        operation.CompleteException(exception);
+                    }
+
                     continue;
                 }
 
                 calls++;
                 if (error == 0)
                 {
-                    this.RemoveRead(operation);
                     if (transferred == 0)
                     {
                         this.endOfFile = true;
-                        operation.CompleteResult(0);
+                        this.RemoveRead(operation);
+                        operation.CompleteResult(operation.Offset);
+                        continue;
                     }
-                    else
+
+                    operation.Offset += transferred;
+                    bytesProcessed += transferred;
+                    if (operation.Offset == operation.Buffer.Length)
                     {
-                        bytesProcessed += transferred;
-                        operation.CompleteResult(transferred);
+                        this.RemoveRead(operation);
+                        operation.CompleteResult(operation.Offset);
                     }
 
                     continue;
@@ -437,12 +454,13 @@ namespace Porta.Pty.Linux
                     {
                         this.endOfFile = true;
                         this.RemoveRead(operation);
-                        operation.CompleteResult(0);
+                        operation.CompleteResult(operation.Offset);
                         continue;
                     }
 
                     if ((events & ReactorError) != 0)
                     {
+                        this.CompleteHeadWithAccumulatedBytes();
                         this.readError = EpollReactor.CreateIOException(
                             "Reading from a PTY after epoll reported an error",
                             error);
@@ -458,7 +476,7 @@ namespace Porta.Pty.Linux
                     {
                         this.endOfFile = true;
                         this.RemoveRead(operation);
-                        operation.CompleteResult(0);
+                        operation.CompleteResult(operation.Offset);
                         continue;
                     }
 
@@ -470,10 +488,14 @@ namespace Porta.Pty.Linux
                     }
                 }
 
+                this.CompleteHeadWithAccumulatedBytes();
                 this.readError = EpollReactor.CreateIOException("Reading from the PTY", error);
                 this.CompleteReadsWithException(() => this.readError);
                 break;
             }
+
+            // No operation holding accumulated bytes may stay queued once a dispatch returns.
+            this.CompleteHeadWithAccumulatedBytes();
 
             if (this.endOfFile)
             {
@@ -701,6 +723,15 @@ namespace Porta.Pty.Linux
             operation.IsQueued = false;
         }
 
+        private void CompleteHeadWithAccumulatedBytes()
+        {
+            if (this.readsHead is { Offset: > 0 } operation)
+            {
+                this.RemoveRead(operation);
+                operation.CompleteResult(operation.Offset);
+            }
+        }
+
         private void CompleteReadsWithResult(int result)
         {
             while (this.readsHead is { } operation)
@@ -834,6 +865,8 @@ namespace Porta.Pty.Linux
             }
 
             internal Memory<byte> Buffer { get; }
+
+            internal int Offset { get; set; }
 
             internal ReadOperation? Next { get; set; }
 
