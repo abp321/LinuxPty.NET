@@ -4,8 +4,8 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>Porta.Pty</RootNamespace>
-    <!-- Assembly simple name differs from the namespace so this fork and upstream Porta.Pty can load side by side in one process. -->
-    <AssemblyName>LinuxPty.NET</AssemblyName>
+    <!-- Published 1.0.x packages shipped assembly identity Porta.Pty and compiled consumers bind to it; the distinct identity exists only for benchmark harnesses loading this library and upstream Porta.Pty in one process (-p:LinuxPtyDistinctAssemblyIdentity=true). -->
+    <AssemblyName Condition="'$(LinuxPtyDistinctAssemblyIdentity)' == 'true'">LinuxPty.NET</AssemblyName>
     <PackageId>LinuxPty.NET</PackageId>
     <Title>LinuxPty.NET</Title>
     <Description>Linux-only pseudoterminal library for .NET 10, derived from Porta.Pty.</Description>
