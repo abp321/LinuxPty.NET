@@ -189,8 +189,8 @@ namespace Porta.Pty.Linux
             catch
             {
                 // A failed process-wide reaper cannot leave an unowned child. Claim it
-                // and hand the blocking wait to the spawn worker instead of blocking
-                // the dying reactor thread.
+                // and hand the blocking wait to the pool instead of blocking the dying
+                // reactor thread.
                 _ = this.SendSignal(SIGKILL);
                 _ = this.EnsureReapedAsync();
             }
@@ -337,8 +337,8 @@ namespace Porta.Pty.Linux
 
                 try
                 {
-                    // The process-wide poller reaps non-blockingly; the spawn worker is
-                    // the only thread that can run a spawn, so it must not block here.
+                    // The process-wide poller reaps non-blockingly; prefer it over the
+                    // blocking claim below.
                     this.RegisterFallback();
                     return this.exitCompletion.Task;
                 }
@@ -355,12 +355,20 @@ namespace Porta.Pty.Linux
 
             try
             {
-                PtySpawnQueue.Shared.Post(() => this.ReapClaimedChild(pidFd));
+                // The blocking wait is bounded: every caller of this path has already sent SIGKILL.
+                ThreadPool.UnsafeQueueUserWorkItem(
+                    static state =>
+                    {
+                        (PtyProcessState process, int fileDescriptor) = state;
+                        process.ReapClaimedChild(fileDescriptor);
+                    },
+                    (this, pidFd),
+                    preferLocal: false);
             }
             catch
             {
-                // A claimed child may never be stranded unreaped. If the process-wide
-                // worker is unavailable, reap on the caller's thread instead.
+                // A claimed child may never be stranded unreaped. If the pool cannot take
+                // the work item, reap on the caller's thread instead.
                 this.ReapClaimedChild(pidFd);
             }
 

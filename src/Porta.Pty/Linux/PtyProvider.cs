@@ -25,7 +25,8 @@ namespace Porta.Pty.Linux
 
             string?[]? environmentMutations = GetEnvironmentMutations(options);
 
-            // This runs on PtySpawnQueue's dedicated worker. Capture the .NET
+            // This runs on a transient pool worker under the process-wide spawn gate.
+            // Capture the .NET
             // managed process environment at execution time, immediately before
             // entering the synchronous native spawn call.
             string?[] inheritedEnvironment = GetInheritedEnvironment();

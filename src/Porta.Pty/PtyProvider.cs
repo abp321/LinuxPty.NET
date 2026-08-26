@@ -13,6 +13,10 @@ namespace Porta.Pty
     /// </summary>
     public static class PtyProvider
     {
+        // The native pty_spawn already serializes across callers with a process-wide
+        // mutex; this gate only bounds the managed side to one pool worker at a time.
+        private static readonly SemaphoreSlim SpawnGate = new(1, 1);
+
         /// <summary>
         /// Spawns a new process connected to a Linux pseudoterminal.
         /// </summary>
@@ -117,7 +121,31 @@ namespace Porta.Pty
                 throw new PlatformNotSupportedException("LinuxPty.NET supports Linux only.");
             }
 
-            return Linux.PtySpawnQueue.Shared.Enqueue(preparedOptions, cancellationToken);
+            return SpawnGatedAsync(preparedOptions, cancellationToken);
+        }
+
+        private static async Task<IPtyConnection> SpawnGatedAsync(
+            PtyOptions preparedOptions,
+            CancellationToken cancellationToken)
+        {
+            await SpawnGate.WaitAsync(cancellationToken);
+            try
+            {
+                IPtyConnection connection = await Task.Run(
+                    () => Linux.PtyProvider.StartTerminalAsync(preparedOptions, cancellationToken));
+
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    await connection.DisposeAsync();
+                    throw new OperationCanceledException(cancellationToken);
+                }
+
+                return connection;
+            }
+            finally
+            {
+                SpawnGate.Release();
+            }
         }
     }
 }
