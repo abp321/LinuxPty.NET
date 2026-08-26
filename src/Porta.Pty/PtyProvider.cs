@@ -68,6 +68,30 @@ namespace Porta.Pty
                 throw new ArgumentNullException(nameof(options.Environment));
             }
 
+            foreach (KeyValuePair<string, string> pair in options.Environment)
+            {
+                if (pair.Key.Length == 0)
+                {
+                    throw new ArgumentException(
+                        "Environment contains an entry with an empty key.",
+                        nameof(options.Environment));
+                }
+
+                if (pair.Key.Contains('=') || pair.Key.Contains('\0'))
+                {
+                    throw new ArgumentException(
+                        $"Environment key '{pair.Key}' contains '=' or an embedded null character.",
+                        nameof(options.Environment));
+                }
+
+                if (pair.Value.Contains('\0'))
+                {
+                    throw new ArgumentException(
+                        $"Environment value for key '{pair.Key}' contains an embedded null character.",
+                        nameof(options.Environment));
+                }
+            }
+
             if (!OperatingSystem.IsLinux())
             {
                 throw new PlatformNotSupportedException("LinuxPty.NET supports Linux only.");

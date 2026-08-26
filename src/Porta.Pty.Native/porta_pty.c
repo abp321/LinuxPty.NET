@@ -429,12 +429,24 @@ static int prepare_environment(
 
     size_t count = 0;
     int error = 0;
+    // Inherited keys are already unique on the managed side, so appending
+    // directly avoids an O(n^2) rescan per entry before fork.
     for (size_t index = 0; error == 0 && index < inherited_count; index++) {
-        error = apply_environment_entry(
-            environment,
-            &count,
-            inherited_environment[index],
-            0);
+        const char* entry = inherited_environment[index];
+        const char* separator = strchr(entry, '=');
+        if (separator == NULL || separator == entry) {
+            continue;
+        }
+
+        char* copied_entry = strdup(entry);
+        if (copied_entry == NULL) {
+            error = ENOMEM;
+            break;
+        }
+
+        environment[count] = copied_entry;
+        count++;
+        environment[count] = NULL;
     }
 
     if (error == 0) {

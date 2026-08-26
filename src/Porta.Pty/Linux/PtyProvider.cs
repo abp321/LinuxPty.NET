@@ -129,7 +129,6 @@ namespace Porta.Pty.Linux
             }
 
             string?[] entries = options.Environment
-                .Where(pair => IsValidEnvironmentEntry(pair.Key, pair.Value))
                 .OrderBy(pair => pair.Key, StringComparer.Ordinal)
                 .Select(pair => $"{pair.Key}={pair.Value}")
                 .Concat(new string?[] { null })
