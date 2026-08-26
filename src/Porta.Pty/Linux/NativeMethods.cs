@@ -21,6 +21,7 @@ namespace Porta.Pty.Linux
         internal const uint ReactorWrite = 2;
         internal const uint ReactorError = 4;
         internal const uint ReactorHangup = 8;
+        internal const uint ReactorOneShot = 16;
 
         private const string LibPortaPty = "libporta_pty";
 

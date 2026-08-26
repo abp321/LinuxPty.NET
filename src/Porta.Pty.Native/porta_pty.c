@@ -144,6 +144,7 @@ enum {
     PTY_REACTOR_WRITE = 2,
     PTY_REACTOR_ERROR = 4,
     PTY_REACTOR_HANGUP = 8,
+    PTY_REACTOR_ONESHOT = 16,
 };
 
 enum {
@@ -1306,6 +1307,10 @@ PTY_EXPORT int pty_reactor_control(
 
         if ((interests & PTY_REACTOR_WRITE) != 0) {
             native_event.events |= EPOLLOUT;
+        }
+
+        if ((interests & PTY_REACTOR_ONESHOT) != 0) {
+            native_event.events |= EPOLLONESHOT;
         }
 
         native_event.data.u64 = token;

@@ -54,8 +54,6 @@ namespace Porta.Pty.Linux
 
         internal ulong ActiveToken { get; set; }
 
-        internal uint ActiveInterest { get; set; }
-
         internal bool IsStoppedOnReactor => this.stoppedOnReactor;
 
         internal static async Task<PtyIoContext> CreateAsync(int fileDescriptor)
@@ -740,7 +738,6 @@ namespace Porta.Pty.Linux
             this.readClosedOnReactor = true;
             this.writeClosedOnReactor = true;
             this.ActiveToken = 0;
-            this.ActiveInterest = 0;
             this.CompleteReadsWithException(() => this.terminalError);
             this.CompleteWritesWithException(() => this.terminalError);
         }

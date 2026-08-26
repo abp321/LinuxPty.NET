@@ -236,25 +236,22 @@ namespace Porta.Pty.Linux
                     ReactorAdd,
                     context.FileDescriptor,
                     token,
-                    desiredInterest);
+                    desiredInterest | ReactorOneShot);
                 if (addError != 0)
                 {
                     throw CreateIOException("Adding PTY epoll interest", addError);
                 }
 
                 context.ActiveToken = token;
-                context.ActiveInterest = desiredInterest;
                 this.activeContexts.Add(token, context);
                 return;
             }
 
+            // One-shot disarms the descriptor on every dispatched event, including the
+            // EPOLLERR and EPOLLHUP that a zero mask cannot suppress, so wanting nothing
+            // costs no syscall and wanting anything must re-arm even if the mask is
+            // unchanged.
             if (desiredInterest == 0)
-            {
-                this.Deactivate(context, ignoreErrors: false);
-                return;
-            }
-
-            if (context.ActiveInterest == desiredInterest)
             {
                 return;
             }
@@ -264,13 +261,11 @@ namespace Porta.Pty.Linux
                 ReactorModify,
                 context.FileDescriptor,
                 context.ActiveToken,
-                desiredInterest);
+                desiredInterest | ReactorOneShot);
             if (modifyError != 0)
             {
                 throw CreateIOException("Modifying PTY epoll interest", modifyError);
             }
-
-            context.ActiveInterest = desiredInterest;
         }
 
         internal static IOException CreateIOException(string operation, int error)
@@ -540,7 +535,6 @@ namespace Porta.Pty.Linux
 
             this.activeContexts.Remove(token);
             context.ActiveToken = 0;
-            context.ActiveInterest = 0;
 
             if (!ignoreErrors && error != 0 && error != ENOENT)
             {
