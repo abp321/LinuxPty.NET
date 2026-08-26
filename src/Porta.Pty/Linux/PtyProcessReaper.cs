@@ -12,7 +12,9 @@ namespace Porta.Pty.Linux
     /// </summary>
     internal sealed class PtyProcessReaper
     {
-        private const int PollIntervalMilliseconds = 20;
+        private const int BasePollIntervalMilliseconds = 20;
+        private const int MaxPollIntervalMilliseconds = 500;
+        private const int PollIntervalGrowthFactor = 2;
         private static readonly Lock SharedGate = new();
         private static PtyProcessReaper? shared;
 
@@ -20,6 +22,8 @@ namespace Porta.Pty.Linux
         private readonly HashSet<PtyProcessState> processes = new();
         private readonly AutoResetEvent wakeEvent;
         private readonly Thread thread;
+        private int pollIntervalMilliseconds = BasePollIntervalMilliseconds;
+        private bool registered;
 
         private PtyProcessReaper()
         {
@@ -62,6 +66,8 @@ namespace Porta.Pty.Linux
 
                 try
                 {
+                    this.pollIntervalMilliseconds = BasePollIntervalMilliseconds;
+                    this.registered = true;
                     this.wakeEvent.Set();
                 }
                 catch
@@ -82,6 +88,7 @@ namespace Porta.Pty.Linux
                     snapshot.AddRange(this.processes);
                 }
 
+                bool reapedAny = false;
                 foreach (PtyProcessState process in snapshot)
                 {
                     if (!process.TryReap(out int exitCode, out Exception? failure))
@@ -89,6 +96,7 @@ namespace Porta.Pty.Linux
                         continue;
                     }
 
+                    reapedAny = true;
                     lock (this.gate)
                     {
                         this.processes.Remove(process);
@@ -99,8 +107,28 @@ namespace Porta.Pty.Linux
 
                 bool hasProcesses = snapshot.Count != 0;
                 snapshot.Clear();
+
+                int waitMilliseconds;
+                lock (this.gate)
+                {
+                    // A registration during this scan already reset the interval; growing now would undo it.
+                    if (reapedAny || this.registered)
+                    {
+                        this.registered = false;
+                        this.pollIntervalMilliseconds = BasePollIntervalMilliseconds;
+                    }
+                    else
+                    {
+                        this.pollIntervalMilliseconds = Math.Min(
+                            this.pollIntervalMilliseconds * PollIntervalGrowthFactor,
+                            MaxPollIntervalMilliseconds);
+                    }
+
+                    waitMilliseconds = this.pollIntervalMilliseconds;
+                }
+
                 this.wakeEvent.WaitOne(
-                    hasProcesses ? PollIntervalMilliseconds : Timeout.Infinite);
+                    hasProcesses ? waitMilliseconds : Timeout.Infinite);
             }
         }
     }
