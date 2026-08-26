@@ -30,6 +30,9 @@ namespace Porta.Pty.Linux
         private const int InlineHeld = 1;
         private const int InlineStopped = 2;
 
+        // Bounds how long a synchronously completing consumer loop can hold a pool worker: every Kth inline completion is delivered asynchronously so the worker re-enters the pool dispatch loop.
+        private const int InlineYieldInterval = 4;
+
         private readonly EpollReactor reactor;
         private readonly Lock stoppedReactorGate = new();
         private readonly Lock stopGate = new();
@@ -42,6 +45,10 @@ namespace Porta.Pty.Linux
         private int writeOpsInFlight;
         private int readInlineOwner;
         private int writeInlineOwner;
+
+        // Touched only while the matching inline owner is held, so a single holder by construction: no Interlocked or Volatile needed.
+        private int consecutiveInlineReads;
+        private int consecutiveInlineWrites;
         private int readCloseRequested;
         private int writeCloseRequested;
         private int stopRequested;
@@ -520,6 +527,7 @@ namespace Porta.Pty.Linux
                     return this.CompleteReadInline(offset);
                 }
 
+                this.consecutiveInlineReads = 0;
                 var operation = new ReadOperation(this, buffer, cancellationToken);
                 try
                 {
@@ -587,6 +595,7 @@ namespace Porta.Pty.Linux
                 }
 
                 // The reactor write loop owns error classification and its hangup knowledge.
+                this.consecutiveInlineWrites = 0;
                 var operation = new WriteOperation(this, buffer, cancellationToken) { Offset = offset };
                 try
                 {
@@ -606,22 +615,58 @@ namespace Porta.Pty.Linux
 
         private ValueTask<int> CompleteReadInline(int result)
         {
-            Interlocked.Decrement(ref this.readOpsInFlight);
+            if (++this.consecutiveInlineReads < InlineYieldInterval)
+            {
+                Interlocked.Decrement(ref this.readOpsInFlight);
+                Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
+                this.KickReadsOnReactor();
+                return new ValueTask<int>(result);
+            }
+
+            this.consecutiveInlineReads = 0;
+
+            // The buffer is unused: the data is already in the caller's buffer. The operation's
+            // OnCompletionClaimed performs the readOpsInFlight decrement, so this path must not.
+            var operation = new ReadOperation(this, default, CancellationToken.None);
             Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
             this.KickReadsOnReactor();
-            return new ValueTask<int>(result);
+            ThreadPool.UnsafeQueueUserWorkItem(
+                static state =>
+                {
+                    var (deferred, count) = state;
+                    deferred.CompleteResult(count);
+                },
+                (operation, result),
+                preferLocal: false);
+            return new ValueTask<int>(operation, operation.Version);
         }
 
         private ValueTask CompleteWriteInline()
         {
-            Interlocked.Decrement(ref this.writeOpsInFlight);
+            if (++this.consecutiveInlineWrites < InlineYieldInterval)
+            {
+                Interlocked.Decrement(ref this.writeOpsInFlight);
+                Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
+                this.KickWritesOnReactor();
+                return ValueTask.CompletedTask;
+            }
+
+            this.consecutiveInlineWrites = 0;
+
+            // OnCompletionClaimed performs the writeOpsInFlight decrement, so this path must not.
+            var operation = new WriteOperation(this, default, CancellationToken.None);
             Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
             this.KickWritesOnReactor();
-            return ValueTask.CompletedTask;
+            ThreadPool.UnsafeQueueUserWorkItem(
+                static deferred => deferred.CompleteResult(),
+                operation,
+                preferLocal: false);
+            return new ValueTask(operation, operation.Version);
         }
 
         private void ReleaseReadInline()
         {
+            this.consecutiveInlineReads = 0;
             Interlocked.Exchange(ref this.readInlineOwner, InlineFree);
             Interlocked.Decrement(ref this.readOpsInFlight);
             this.KickReadsOnReactor();
@@ -629,6 +674,7 @@ namespace Porta.Pty.Linux
 
         private void ReleaseWriteInline()
         {
+            this.consecutiveInlineWrites = 0;
             Interlocked.Exchange(ref this.writeInlineOwner, InlineFree);
             Interlocked.Decrement(ref this.writeOpsInFlight);
             this.KickWritesOnReactor();
