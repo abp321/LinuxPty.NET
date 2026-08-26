@@ -4,11 +4,10 @@
 namespace Porta.Pty.Linux
 {
     using System;
-    using System.Buffers;
-    using System.Collections.Generic;
     using System.IO;
     using System.Threading;
     using System.Threading.Tasks;
+    using System.Threading.Tasks.Sources;
     using static Porta.Pty.Linux.NativeMethods;
 
     /// <summary>
@@ -25,10 +24,12 @@ namespace Porta.Pty.Linux
         private const int MaxWriteSize = 16 * 1024;
 
         private readonly EpollReactor reactor;
-        private readonly LinkedList<ReadOperation> reads = new();
-        private readonly LinkedList<WriteOperation> writes = new();
         private readonly Lock stoppedReactorGate = new();
         private readonly Lock stopGate = new();
+        private ReadOperation? readsHead;
+        private ReadOperation? readsTail;
+        private WriteOperation? writesHead;
+        private WriteOperation? writesTail;
         private int accepting = 1;
         private int readCloseRequested;
         private int writeCloseRequested;
@@ -88,7 +89,7 @@ namespace Porta.Pty.Linux
                 operation.CompleteException(exception);
             }
 
-            return new ValueTask<int>(operation.Task);
+            return new ValueTask<int>(operation, operation.Version);
         }
 
         internal ValueTask WriteAsync(
@@ -116,7 +117,7 @@ namespace Porta.Pty.Linux
                 operation.CompleteException(exception);
             }
 
-            return new ValueTask(operation.Task);
+            return new ValueTask(operation, operation.Version);
         }
 
         internal Task CloseSideAsync(bool readSide)
@@ -285,8 +286,8 @@ namespace Porta.Pty.Linux
                 return;
             }
 
-            bool wasEmpty = this.reads.Count == 0;
-            operation.Node = this.reads.AddLast(operation);
+            bool wasEmpty = this.readsHead is null;
+            this.AddRead(operation);
             if (wasEmpty)
             {
                 this.ProcessReadsOnReactor(0);
@@ -332,8 +333,8 @@ namespace Porta.Pty.Linux
                 return;
             }
 
-            bool wasEmpty = this.writes.Count == 0;
-            operation.Node = this.writes.AddLast(operation);
+            bool wasEmpty = this.writesHead is null;
+            this.AddWrite(operation);
             if (wasEmpty)
             {
                 this.ProcessWritesOnReactor(0);
@@ -348,12 +349,7 @@ namespace Porta.Pty.Linux
             {
                 this.reactor.PostContextCommand(this, () =>
                 {
-                    if (operation.Node is { } node)
-                    {
-                        this.reads.Remove(node);
-                        operation.Node = null;
-                    }
-
+                    this.RemoveRead(operation);
                     operation.CompleteCanceled();
                     this.UpdateInterestOnReactor();
                 });
@@ -370,12 +366,7 @@ namespace Porta.Pty.Linux
             {
                 this.reactor.PostContextCommand(this, () =>
                 {
-                    if (operation.Node is { } node)
-                    {
-                        this.writes.Remove(node);
-                        operation.Node = null;
-                    }
-
+                    this.RemoveWrite(operation);
                     operation.CompleteCanceled();
                     this.UpdateInterestOnReactor();
                 });
@@ -390,13 +381,12 @@ namespace Porta.Pty.Linux
         {
             int bytesProcessed = 0;
             int calls = 0;
-            while (this.reads.First is { } node
+            while (this.readsHead is { } operation
                 && bytesProcessed < MaxBytesPerDispatch
                 && calls < MaxCallsPerDispatch
                 && Volatile.Read(ref this.stopRequested) == 0
                 && Volatile.Read(ref this.readCloseRequested) == 0)
             {
-                ReadOperation operation = node.Value;
                 if (operation.IsCancellationRequested)
                 {
                     this.RemoveRead(operation);
@@ -497,13 +487,12 @@ namespace Porta.Pty.Linux
         {
             int bytesProcessed = 0;
             int calls = 0;
-            while (this.writes.First is { } node
+            while (this.writesHead is { } operation
                 && bytesProcessed < MaxBytesPerDispatch
                 && calls < MaxCallsPerDispatch
                 && Volatile.Read(ref this.stopRequested) == 0
                 && Volatile.Read(ref this.writeCloseRequested) == 0)
             {
-                WriteOperation operation = node.Value;
                 if (operation.IsCancellationRequested)
                 {
                     this.RemoveWrite(operation);
@@ -579,7 +568,7 @@ namespace Porta.Pty.Linux
             uint interest = 0;
             if (Volatile.Read(ref this.stopRequested) == 0
                 && Volatile.Read(ref this.readCloseRequested) == 0
-                && this.reads.Count != 0
+                && this.readsHead is not null
                 && this.readError == null
                 && !this.endOfFile)
             {
@@ -588,7 +577,7 @@ namespace Porta.Pty.Linux
 
             if (Volatile.Read(ref this.stopRequested) == 0
                 && Volatile.Read(ref this.writeCloseRequested) == 0
-                && this.writes.Count != 0
+                && this.writesHead is not null
                 && this.writeError == null)
             {
                 interest |= ReactorWrite;
@@ -599,60 +588,135 @@ namespace Porta.Pty.Linux
 
         private unsafe int Read(Memory<byte> buffer, int count, out int transferred)
         {
-            using MemoryHandle handle = buffer.Pin();
-            return pty_io_read(
-                this.FileDescriptor,
-                (IntPtr)handle.Pointer,
-                count,
-                out transferred);
+            // count is always at least 1, so the span is never empty and the pointer never null.
+            fixed (byte* pointer = buffer.Span)
+            {
+                return pty_io_read(
+                    this.FileDescriptor,
+                    (IntPtr)pointer,
+                    count,
+                    out transferred);
+            }
         }
 
         private unsafe int Write(ReadOnlyMemory<byte> buffer, int count, out int transferred)
         {
-            using MemoryHandle handle = buffer.Pin();
-            return pty_io_write(
-                this.FileDescriptor,
-                (IntPtr)handle.Pointer,
-                count,
-                out transferred);
+            fixed (byte* pointer = buffer.Span)
+            {
+                return pty_io_write(
+                    this.FileDescriptor,
+                    (IntPtr)pointer,
+                    count,
+                    out transferred);
+            }
+        }
+
+        private void AddRead(ReadOperation operation)
+        {
+            operation.Previous = this.readsTail;
+            if (this.readsTail is null)
+            {
+                this.readsHead = operation;
+            }
+            else
+            {
+                this.readsTail.Next = operation;
+            }
+
+            this.readsTail = operation;
+            operation.IsQueued = true;
+        }
+
+        private void AddWrite(WriteOperation operation)
+        {
+            operation.Previous = this.writesTail;
+            if (this.writesTail is null)
+            {
+                this.writesHead = operation;
+            }
+            else
+            {
+                this.writesTail.Next = operation;
+            }
+
+            this.writesTail = operation;
+            operation.IsQueued = true;
         }
 
         private void RemoveRead(ReadOperation operation)
         {
-            if (operation.Node is { } node)
+            if (!operation.IsQueued)
             {
-                this.reads.Remove(node);
-                operation.Node = null;
+                return;
             }
+
+            if (operation.Previous is { } previous)
+            {
+                previous.Next = operation.Next;
+            }
+            else
+            {
+                this.readsHead = operation.Next;
+            }
+
+            if (operation.Next is { } next)
+            {
+                next.Previous = operation.Previous;
+            }
+            else
+            {
+                this.readsTail = operation.Previous;
+            }
+
+            operation.Previous = null;
+            operation.Next = null;
+            operation.IsQueued = false;
         }
 
         private void RemoveWrite(WriteOperation operation)
         {
-            if (operation.Node is { } node)
+            if (!operation.IsQueued)
             {
-                this.writes.Remove(node);
-                operation.Node = null;
+                return;
             }
+
+            if (operation.Previous is { } previous)
+            {
+                previous.Next = operation.Next;
+            }
+            else
+            {
+                this.writesHead = operation.Next;
+            }
+
+            if (operation.Next is { } next)
+            {
+                next.Previous = operation.Previous;
+            }
+            else
+            {
+                this.writesTail = operation.Previous;
+            }
+
+            operation.Previous = null;
+            operation.Next = null;
+            operation.IsQueued = false;
         }
 
         private void CompleteReadsWithResult(int result)
         {
-            while (this.reads.First is { } node)
+            while (this.readsHead is { } operation)
             {
-                ReadOperation operation = node.Value;
-                this.reads.RemoveFirst();
-                operation.Node = null;
+                this.RemoveRead(operation);
                 operation.CompleteResult(result);
             }
         }
 
         private void CompleteReadsWithException(Func<Exception?> exceptionFactory)
         {
-            while (this.reads.First is { } node)
+            while (this.readsHead is { } operation)
             {
-                ReadOperation operation = node.Value;
-                this.reads.RemoveFirst();
-                operation.Node = null;
+                this.RemoveRead(operation);
                 operation.CompleteException(
                     exceptionFactory() ?? new IOException("Reading from the PTY failed."));
             }
@@ -660,11 +724,9 @@ namespace Porta.Pty.Linux
 
         private void CompleteWritesWithException(Func<Exception?> exceptionFactory)
         {
-            while (this.writes.First is { } node)
+            while (this.writesHead is { } operation)
             {
-                WriteOperation operation = node.Value;
-                this.writes.RemoveFirst();
-                operation.Node = null;
+                this.RemoveWrite(operation);
                 operation.CompleteException(
                     exceptionFactory() ?? new IOException("Writing to the PTY failed."));
             }
@@ -685,34 +747,33 @@ namespace Porta.Pty.Linux
 
         private abstract class IoOperation
         {
-            private readonly Lock completionGate = new();
+            private const int RegistrationAssigned = 1;
+            private const int RegistrationTaken = 2;
+
+            private ManualResetValueTaskSourceCore<int> core;
             private CancellationTokenRegistration cancellationRegistration;
-            private bool cancellationRegistrationAssigned;
-            private bool completed;
+            private int registrationState;
+            private int completed;
             private int cancellationRequested;
 
             protected IoOperation(PtyIoContext context, CancellationToken cancellationToken)
             {
                 this.Context = context;
                 this.CancellationToken = cancellationToken;
+                this.core.RunContinuationsAsynchronously = true;
             }
+
+            internal short Version => this.core.Version;
+
+            internal bool IsCancellationRequested => Volatile.Read(ref this.cancellationRequested) != 0;
+
+            internal bool IsCompleted => Volatile.Read(ref this.completed) != 0;
 
             protected PtyIoContext Context { get; }
 
             protected CancellationToken CancellationToken { get; }
 
-            internal bool IsCancellationRequested => Volatile.Read(ref this.cancellationRequested) != 0;
-
-            internal bool IsCompleted
-            {
-                get
-                {
-                    lock (this.completionGate)
-                    {
-                        return this.completed;
-                    }
-                }
-            }
+            protected ref ManualResetValueTaskSourceCore<int> Core => ref this.core;
 
             internal void RegisterCancellation()
             {
@@ -725,15 +786,11 @@ namespace Porta.Pty.Linux
                     static state => ((IoOperation)state!).CancellationCallback(),
                     this);
 
-                bool disposeRegistration;
-                lock (this.completionGate)
-                {
-                    this.cancellationRegistration = registration;
-                    this.cancellationRegistrationAssigned = true;
-                    disposeRegistration = this.completed;
-                }
+                this.cancellationRegistration = registration;
+                Volatile.Write(ref this.registrationState, RegistrationAssigned);
 
-                if (disposeRegistration)
+                // A completion that ran before the registration was published could not claim it.
+                if (Volatile.Read(ref this.completed) != 0 && this.TryTakeRegistration())
                 {
                     registration.Dispose();
                 }
@@ -741,20 +798,24 @@ namespace Porta.Pty.Linux
 
             protected bool TryBeginCompletion(out CancellationTokenRegistration registration)
             {
-                lock (this.completionGate)
+                if (Interlocked.CompareExchange(ref this.completed, 1, 0) != 0)
                 {
-                    if (this.completed)
-                    {
-                        registration = default;
-                        return false;
-                    }
-
-                    this.completed = true;
-                    registration = this.cancellationRegistrationAssigned
-                        ? this.cancellationRegistration
-                        : default;
-                    return true;
+                    registration = default;
+                    return false;
                 }
+
+                registration = this.TryTakeRegistration() ? this.cancellationRegistration : default;
+                return true;
+            }
+
+            protected abstract void RequestCancellation();
+
+            private bool TryTakeRegistration()
+            {
+                return Interlocked.CompareExchange(
+                    ref this.registrationState,
+                    RegistrationTaken,
+                    RegistrationAssigned) == RegistrationAssigned;
             }
 
             private void CancellationCallback()
@@ -762,15 +823,10 @@ namespace Porta.Pty.Linux
                 Interlocked.Exchange(ref this.cancellationRequested, 1);
                 this.RequestCancellation();
             }
-
-            protected abstract void RequestCancellation();
         }
 
-        private sealed class ReadOperation : IoOperation
+        private sealed class ReadOperation : IoOperation, IValueTaskSource<int>
         {
-            private readonly TaskCompletionSource<int> completion = new(
-                TaskCreationOptions.RunContinuationsAsynchronously);
-
             internal ReadOperation(
                 PtyIoContext context,
                 Memory<byte> buffer,
@@ -782,16 +838,37 @@ namespace Porta.Pty.Linux
 
             internal Memory<byte> Buffer { get; }
 
-            internal LinkedListNode<ReadOperation>? Node { get; set; }
+            internal ReadOperation? Next { get; set; }
 
-            internal Task<int> Task => this.completion.Task;
+            internal ReadOperation? Previous { get; set; }
+
+            internal bool IsQueued { get; set; }
+
+            public int GetResult(short token)
+            {
+                return this.Core.GetResult(token);
+            }
+
+            public ValueTaskSourceStatus GetStatus(short token)
+            {
+                return this.Core.GetStatus(token);
+            }
+
+            public void OnCompleted(
+                Action<object?> continuation,
+                object? state,
+                short token,
+                ValueTaskSourceOnCompletedFlags flags)
+            {
+                this.Core.OnCompleted(continuation, state, token, flags);
+            }
 
             internal void CompleteResult(int result)
             {
                 if (this.TryBeginCompletion(out CancellationTokenRegistration registration))
                 {
                     registration.Dispose();
-                    this.completion.TrySetResult(result);
+                    this.Core.SetResult(result);
                 }
             }
 
@@ -800,7 +877,7 @@ namespace Porta.Pty.Linux
                 if (this.TryBeginCompletion(out CancellationTokenRegistration registration))
                 {
                     registration.Dispose();
-                    this.completion.TrySetCanceled(this.CancellationToken);
+                    this.Core.SetException(new OperationCanceledException(this.CancellationToken));
                 }
             }
 
@@ -809,7 +886,7 @@ namespace Porta.Pty.Linux
                 if (this.TryBeginCompletion(out CancellationTokenRegistration registration))
                 {
                     registration.Dispose();
-                    this.completion.TrySetException(exception);
+                    this.Core.SetException(exception);
                 }
             }
 
@@ -819,11 +896,8 @@ namespace Porta.Pty.Linux
             }
         }
 
-        private sealed class WriteOperation : IoOperation
+        private sealed class WriteOperation : IoOperation, IValueTaskSource
         {
-            private readonly TaskCompletionSource<object?> completion = new(
-                TaskCreationOptions.RunContinuationsAsynchronously);
-
             internal WriteOperation(
                 PtyIoContext context,
                 ReadOnlyMemory<byte> buffer,
@@ -837,16 +911,37 @@ namespace Porta.Pty.Linux
 
             internal int Offset { get; set; }
 
-            internal LinkedListNode<WriteOperation>? Node { get; set; }
+            internal WriteOperation? Next { get; set; }
 
-            internal Task Task => this.completion.Task;
+            internal WriteOperation? Previous { get; set; }
+
+            internal bool IsQueued { get; set; }
+
+            public void GetResult(short token)
+            {
+                this.Core.GetResult(token);
+            }
+
+            public ValueTaskSourceStatus GetStatus(short token)
+            {
+                return this.Core.GetStatus(token);
+            }
+
+            public void OnCompleted(
+                Action<object?> continuation,
+                object? state,
+                short token,
+                ValueTaskSourceOnCompletedFlags flags)
+            {
+                this.Core.OnCompleted(continuation, state, token, flags);
+            }
 
             internal void CompleteResult()
             {
                 if (this.TryBeginCompletion(out CancellationTokenRegistration registration))
                 {
                     registration.Dispose();
-                    this.completion.TrySetResult(null);
+                    this.Core.SetResult(0);
                 }
             }
 
@@ -855,7 +950,7 @@ namespace Porta.Pty.Linux
                 if (this.TryBeginCompletion(out CancellationTokenRegistration registration))
                 {
                     registration.Dispose();
-                    this.completion.TrySetCanceled(this.CancellationToken);
+                    this.Core.SetException(new OperationCanceledException(this.CancellationToken));
                 }
             }
 
@@ -864,7 +959,7 @@ namespace Porta.Pty.Linux
                 if (this.TryBeginCompletion(out CancellationTokenRegistration registration))
                 {
                     registration.Dispose();
-                    this.completion.TrySetException(exception);
+                    this.Core.SetException(exception);
                 }
             }
 
