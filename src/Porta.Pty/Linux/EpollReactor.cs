@@ -453,6 +453,26 @@ namespace Porta.Pty.Linux
             this.FailReactor(exception);
         }
 
+        /// <summary>
+        /// Fails the engine from an off-loop thread by marshalling the teardown into the loop.
+        /// </summary>
+        internal void PostExternalFailure(Exception exception)
+        {
+            try
+            {
+                // Teardown must run in the loop's serialized callback context, so the failure is
+                // marshalled as a command whose throw takes the same RunExternalEntry to
+                // FailReactor path a faulty dispatch takes. The wake registration is armed here
+                // (the callback that faulted the registration command re-armed it), so the command
+                // is drained promptly. A Post that throws means the engine already failed and
+                // teardown already ran.
+                this.Post(() => throw exception);
+            }
+            catch
+            {
+            }
+        }
+
         internal bool IsStopped => Volatile.Read(ref this.fatalError) != null;
 
         private static TaskCompletionSource<object?> CreateCompletionSource()

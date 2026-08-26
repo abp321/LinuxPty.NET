@@ -109,8 +109,9 @@ namespace Porta.Pty.Linux
                 if (eventLoop is not null && reactor is not null)
                 {
                     // An external engine that never took ownership of anything can never reach
-                    // idle-close, so its backend registrations and descriptors would leak.
-                    reactor.ExternalFail(exception);
+                    // idle-close, so its backend registrations and descriptors would leak. This
+                    // runs on a spawn worker, so the teardown is marshalled to the loop.
+                    reactor.PostExternalFailure(exception);
                 }
 
                 if (processState is null)
