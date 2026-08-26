@@ -59,10 +59,29 @@ namespace Porta.Pty.Linux
                     result.Pid,
                     result.PidFd,
                     result.PidFdError);
-                await processState.StartAsync().ConfigureAwait(false);
-                cancellationToken.ThrowIfCancellationRequested();
+                PtyProcessState? pidFdProcess = processState.TryBeginEpollRegistration()
+                    ? processState
+                    : null;
+                Exception? pidFdFailure;
+                try
+                {
+                    (ioContext, pidFdFailure) = await PtyIoContext
+                        .CreateAsync(result.MasterFd, pidFdProcess)
+                        .ConfigureAwait(false);
+                }
+                catch when (pidFdProcess is not null)
+                {
+                    // The fused command faulted before claiming the pidfd, so the child is
+                    // still parked in RegisteringEpoll and nothing would ever reap it.
+                    pidFdProcess.UseFallbackAfterFailedRegistration();
+                    throw;
+                }
 
-                ioContext = await PtyIoContext.CreateAsync(result.MasterFd).ConfigureAwait(false);
+                if (pidFdFailure is not null)
+                {
+                    processState.UseFallbackAfterFailedRegistration();
+                }
+
                 cancellationToken.ThrowIfCancellationRequested();
 
                 return new PtyConnection(result.MasterFd, result.Pid, ioContext, processState);

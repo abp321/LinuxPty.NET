@@ -78,9 +78,15 @@ namespace Porta.Pty.Linux
             }
         }
 
-        internal Task RegisterAsync(PtyIoContext context)
+        /// <summary>
+        /// Registers the context and, when present, the child's pidfd in one reactor round trip.
+        /// A faulted task means the context registration failed and the spawn must fail; a non-null
+        /// result means only the pidfd registration failed and the caller falls back to polling.
+        /// </summary>
+        internal Task<Exception?> RegisterConnectionAsync(PtyIoContext context, PtyProcessState? process)
         {
-            var completion = CreateCompletionSource();
+            var completion = new TaskCompletionSource<Exception?>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
             this.Post(() =>
             {
                 try
@@ -91,22 +97,19 @@ namespace Porta.Pty.Linux
                     }
 
                     this.contexts.Add(context);
-                    completion.TrySetResult(null);
                 }
                 catch (Exception exception)
                 {
                     completion.TrySetException(exception);
+                    return;
                 }
-            });
 
-            return completion.Task;
-        }
+                if (process is null)
+                {
+                    completion.TrySetResult(null);
+                    return;
+                }
 
-        internal Task RegisterProcessAsync(PtyProcessState process)
-        {
-            var completion = CreateCompletionSource();
-            this.Post(() =>
-            {
                 ulong token = 0;
                 bool reactorRegistered = false;
                 bool activeProcessAdded = false;
@@ -167,7 +170,7 @@ namespace Porta.Pty.Linux
                                 0));
                     }
 
-                    completion.TrySetException(exception);
+                    completion.TrySetResult(exception);
                 }
             });
 

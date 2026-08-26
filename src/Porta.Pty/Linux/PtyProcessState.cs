@@ -83,33 +83,37 @@ namespace Porta.Pty.Linux
             }
         }
 
-        internal async Task StartAsync()
+        /// <summary>
+        /// Claims the child for pidfd registration, or hands it to the fallback reaper when
+        /// there is no pidfd. Returns whether the caller must still register with the reactor.
+        /// </summary>
+        internal bool TryBeginEpollRegistration()
         {
-            if (this.pidFileDescriptor >= 0)
+            if (this.pidFileDescriptor < 0)
             {
-                lock (this.reapGate)
+                this.RegisterFallback();
+                return false;
+            }
+
+            lock (this.reapGate)
+            {
+                this.lifetimeState = LifetimeState.RegisteringEpoll;
+            }
+
+            return true;
+        }
+
+        internal void UseFallbackAfterFailedRegistration()
+        {
+            lock (this.reapGate)
+            {
+                if (this.lifetimeState != LifetimeState.RegisteringEpoll)
                 {
-                    this.lifetimeState = LifetimeState.RegisteringEpoll;
+                    throw new InvalidOperationException(
+                        "The pidfd registration did not return ownership.");
                 }
 
-                try
-                {
-                    await EpollReactor.Shared.RegisterProcessAsync(this).ConfigureAwait(false);
-                    return;
-                }
-                catch
-                {
-                    lock (this.reapGate)
-                    {
-                        if (this.lifetimeState != LifetimeState.RegisteringEpoll)
-                        {
-                            throw new InvalidOperationException(
-                                "The pidfd registration did not return ownership.");
-                        }
-
-                        this.lifetimeState = LifetimeState.Unowned;
-                    }
-                }
+                this.lifetimeState = LifetimeState.Unowned;
             }
 
             this.RegisterFallback();

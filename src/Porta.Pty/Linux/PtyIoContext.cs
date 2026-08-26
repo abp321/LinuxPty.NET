@@ -67,12 +67,15 @@ namespace Porta.Pty.Linux
 
         internal bool IsStoppedOnReactor => this.stoppedOnReactor;
 
-        internal static async Task<PtyIoContext> CreateAsync(int fileDescriptor)
+        internal static async Task<(PtyIoContext Context, Exception? ProcessFailure)> CreateAsync(
+            int fileDescriptor,
+            PtyProcessState? process)
         {
             EpollReactor reactor = EpollReactor.Shared;
             var context = new PtyIoContext(fileDescriptor, reactor);
-            await reactor.RegisterAsync(context).ConfigureAwait(false);
-            return context;
+            Exception? processFailure =
+                await reactor.RegisterConnectionAsync(context, process).ConfigureAwait(false);
+            return (context, processFailure);
         }
 
         internal ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken)
