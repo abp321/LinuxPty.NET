@@ -21,6 +21,10 @@ namespace Porta.Pty.Linux
         private const int EPIPE = 32;
         private const int MaxBytesPerDispatch = 64 * 1024;
         private const int MaxCallsPerDispatch = 16;
+
+        // A parked operation completes at this much so one busy descriptor cannot hold the reactor for a full 64 KB fill while a small ready read waits; the consumer's next read drains the rest inline.
+        private const int ReactorFillQuantum = 16 * 1024;
+
         private const int MaxWriteSize = 16 * 1024;
         private const int InlineFree = 0;
         private const int InlineHeld = 1;
@@ -856,7 +860,7 @@ namespace Porta.Pty.Linux
 
                     operation.Offset += transferred;
                     bytesProcessed += transferred;
-                    if (operation.Offset == operation.Buffer.Length)
+                    if (operation.Offset == operation.Buffer.Length || operation.Offset >= ReactorFillQuantum)
                     {
                         this.RemoveRead(operation);
                         operation.CompleteResult(operation.Offset);
