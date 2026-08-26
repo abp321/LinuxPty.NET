@@ -17,6 +17,11 @@ namespace Porta.Pty.Linux
     /// </summary>
     internal static class PtyProvider
     {
+        // The native pty_spawn already serializes across callers with a process-wide
+        // mutex; this gate only bounds the managed side to one pool worker at a time,
+        // and covers only the synchronous native spawn section below.
+        private static readonly SemaphoreSlim SpawnGate = new(1, 1);
+
         internal static async Task<IPtyConnection> StartTerminalAsync(
             PtyOptions options,
             CancellationToken cancellationToken)
@@ -25,20 +30,28 @@ namespace Porta.Pty.Linux
 
             string?[]? environmentMutations = GetEnvironmentMutations(options);
 
-            // This runs on a transient pool worker under the process-wide spawn gate.
-            // Capture the .NET
-            // managed process environment at execution time, immediately before
-            // entering the synchronous native spawn call.
+            // This runs on a transient pool worker. Capture the .NET managed process
+            // environment at execution time, immediately before entering the
+            // synchronous native spawn call.
             string?[] inheritedEnvironment = GetInheritedEnvironment();
 
-            PtySpawnResult result = pty_spawn(
-                options.App,
-                terminalArgs,
-                inheritedEnvironment,
-                environmentMutations,
-                options.Cwd,
-                (ushort)options.Rows,
-                (ushort)options.Cols);
+            await SpawnGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            PtySpawnResult result;
+            try
+            {
+                result = pty_spawn(
+                    options.App,
+                    terminalArgs,
+                    inheritedEnvironment,
+                    environmentMutations,
+                    options.Cwd,
+                    (ushort)options.Rows,
+                    (ushort)options.Cols);
+            }
+            finally
+            {
+                SpawnGate.Release();
+            }
 
             if (result.Pid == -1)
             {

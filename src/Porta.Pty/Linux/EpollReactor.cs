@@ -25,6 +25,7 @@ namespace Porta.Pty.Linux
         private const int FallbackBasePollMilliseconds = 20;
         private const int FallbackMaxPollMilliseconds = 500;
         private const int FallbackPollGrowthFactor = 2;
+        private const int FallbackScanBatchLimit = 64;
 
         private static readonly Lock SharedGate = new();
         private static EpollReactor? shared;
@@ -38,11 +39,14 @@ namespace Porta.Pty.Linux
         private readonly Dictionary<ulong, PtyProcessState> activeProcesses = new();
         private readonly HashSet<PtyIoContext> contexts = new();
         private readonly HashSet<PtyProcessState> processes = new();
-        private readonly HashSet<PtyProcessState> fallbackProcesses = new();
+        private readonly List<PtyProcessState> fallbackProcesses = new();
         private readonly unsafe PtyReactorEvent* events;
         private readonly Thread thread;
         private long nextToken;
         private int fallbackPollIntervalMilliseconds = FallbackBasePollMilliseconds;
+        private int fallbackScanCursor;
+        private bool fallbackTimerArmed;
+        private long fallbackTimerDeadline;
         private bool fallbackRegistered;
         private Exception? fatalError;
 
@@ -59,14 +63,13 @@ namespace Porta.Pty.Linux
                 throw CreateIOException("Creating the PTY epoll reactor", error);
             }
 
-            this.thread = new Thread(this.Run)
-            {
-                IsBackground = true,
-                Name = "LinuxPty.NET epoll reactor",
-            };
-
             try
             {
+                this.thread = new Thread(this.Run)
+                {
+                    IsBackground = true,
+                    Name = "LinuxPty.NET epoll reactor",
+                };
                 this.events = (PtyReactorEvent*)NativeMemory.Alloc(
                     (nuint)(EventCapacity * sizeof(PtyReactorEvent)));
                 this.thread.Start();
@@ -214,10 +217,19 @@ namespace Porta.Pty.Linux
                     return;
                 }
 
-                if (this.fallbackProcesses.Add(process))
+                if (this.fallbackProcesses.Contains(process))
                 {
-                    this.fallbackRegistered = true;
-                    this.fallbackPollIntervalMilliseconds = FallbackBasePollMilliseconds;
+                    return;
+                }
+
+                this.fallbackProcesses.Add(process);
+                this.fallbackRegistered = true;
+                this.fallbackPollIntervalMilliseconds = FallbackBasePollMilliseconds;
+
+                // A pending scan deadline may be pulled earlier, never pushed later.
+                if (!this.fallbackTimerArmed
+                    || Environment.TickCount64 + FallbackBasePollMilliseconds < this.fallbackTimerDeadline)
+                {
                     this.ArmFallbackTimer(FallbackBasePollMilliseconds);
                 }
             });
@@ -410,6 +422,7 @@ namespace Porta.Pty.Linux
 
                     if (timerFired)
                     {
+                        this.fallbackTimerArmed = false;
                         error = pty_reactor_drain(this.timerFd);
                         if (error != 0)
                         {
@@ -609,27 +622,66 @@ namespace Porta.Pty.Linux
 
         private void ScanFallbackProcesses()
         {
-            var reaped = new List<FallbackReapResult>();
-            foreach (PtyProcessState process in this.fallbackProcesses)
+            int count = this.fallbackProcesses.Count;
+            int visits = Math.Min(count, FallbackScanBatchLimit);
+            if (this.fallbackScanCursor >= count)
             {
+                this.fallbackScanCursor = 0;
+            }
+
+            // The list is not mutated while it is being walked, so the visits distinct
+            // offsets from the cursor map to visits distinct entries.
+            var reaped = new List<FallbackReapResult>();
+            for (int visited = 0; visited < visits; visited++)
+            {
+                PtyProcessState process =
+                    this.fallbackProcesses[(this.fallbackScanCursor + visited) % count];
                 if (process.TryReap(out int exitCode, out Exception? failure))
                 {
                     reaped.Add(new FallbackReapResult(process, exitCode, failure));
                 }
             }
 
+            this.fallbackScanCursor += visits;
+
             foreach (FallbackReapResult result in reaped)
             {
-                this.fallbackProcesses.Remove(result.Process);
+                int index = this.fallbackProcesses.IndexOf(result.Process);
+                int last = this.fallbackProcesses.Count - 1;
+                this.fallbackProcesses[index] = this.fallbackProcesses[last];
+                this.fallbackProcesses.RemoveAt(last);
+                if (index < this.fallbackScanCursor)
+                {
+                    this.fallbackScanCursor--;
+                }
+
                 result.Process.FinishReapingFromFallback(result.ExitCode, result.Failure);
             }
 
-            // A registration during this scan already reset the interval; growing now would undo it.
-            this.fallbackPollIntervalMilliseconds = reaped.Count != 0 || this.fallbackRegistered
-                ? FallbackBasePollMilliseconds
-                : Math.Min(
-                    this.fallbackPollIntervalMilliseconds * FallbackPollGrowthFactor,
-                    FallbackMaxPollMilliseconds);
+            if (this.fallbackProcesses.Count == 0)
+            {
+                this.fallbackScanCursor = 0;
+            }
+            else
+            {
+                this.fallbackScanCursor %= this.fallbackProcesses.Count;
+            }
+
+            if (visits < count)
+            {
+                // Children past the batch cap went unvisited this fire; scan them promptly.
+                this.fallbackPollIntervalMilliseconds = FallbackBasePollMilliseconds;
+            }
+            else
+            {
+                // A registration during this scan already reset the interval; growing now would undo it.
+                this.fallbackPollIntervalMilliseconds = reaped.Count != 0 || this.fallbackRegistered
+                    ? FallbackBasePollMilliseconds
+                    : Math.Min(
+                        this.fallbackPollIntervalMilliseconds * FallbackPollGrowthFactor,
+                        FallbackMaxPollMilliseconds);
+            }
+
             this.fallbackRegistered = false;
 
             if (this.fallbackProcesses.Count != 0)
@@ -647,6 +699,9 @@ namespace Porta.Pty.Linux
                 // rehomes every fallback child.
                 throw CreateIOException("Arming the PTY fallback poll timer", error);
             }
+
+            this.fallbackTimerDeadline = Environment.TickCount64 + milliseconds;
+            this.fallbackTimerArmed = true;
         }
 
         private void Deactivate(PtyIoContext context, bool ignoreErrors)
