@@ -15,6 +15,9 @@ namespace Porta.Pty.Linux
     /// </summary>
     internal sealed class PtyProcessState
     {
+        // Shell and System.Diagnostics.Process convention for a signalled child.
+        private const int SignaledExitCodeBase = 128;
+
         private readonly int pid;
         private readonly Lock reapGate = new();
         private readonly TaskCompletionSource<int> exitCompletion = new(
@@ -214,7 +217,11 @@ namespace Porta.Pty.Linux
                 {
                     exitCode = result.ExitCode;
                 }
-                else if (result.State is PtyWaitState.Signaled or PtyWaitState.Unavailable)
+                else if (result.State == PtyWaitState.Signaled)
+                {
+                    exitCode = SignaledExitCodeBase + result.Signal;
+                }
+                else if (result.State == PtyWaitState.Unavailable)
                 {
                     exitCode = 0;
                 }
@@ -327,7 +334,11 @@ namespace Porta.Pty.Linux
             {
                 exitCode = result.ExitCode;
             }
-            else if (result.State is PtyWaitState.Signaled or PtyWaitState.Unavailable)
+            else if (result.State == PtyWaitState.Signaled)
+            {
+                exitCode = SignaledExitCodeBase + result.Signal;
+            }
+            else if (result.State == PtyWaitState.Unavailable)
             {
                 exitCode = 0;
             }

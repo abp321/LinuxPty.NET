@@ -20,8 +20,8 @@ namespace Porta.Pty
         }
 
         /// <summary>
-        /// Gets or sets the exit code of the pty process.
+        /// Gets the exit code of the pty process.
         /// </summary>
-        public int ExitCode { get; set; }
+        public int ExitCode { get; }
     }
 }

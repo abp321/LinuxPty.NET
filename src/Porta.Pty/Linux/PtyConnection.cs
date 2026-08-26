@@ -27,6 +27,7 @@ namespace Porta.Pty.Linux
         private readonly Lock exitEventGate = new();
         private EventHandler<PtyExitedEventArgs>? processExited;
         private bool exitEventRaised;
+        private int raisedExitCode;
         private int masterClosed;
         private bool isDisposed;
         private Task? disposalTask;
@@ -50,9 +51,20 @@ namespace Porta.Pty.Linux
         {
             add
             {
+                bool replay;
+                int exitCode;
                 lock (this.exitEventGate)
                 {
                     this.processExited += value;
+                    replay = this.exitEventRaised && value is not null;
+                    exitCode = this.raisedExitCode;
+                }
+
+                // The child can be reaped before the caller subscribes, so a late
+                // handler is invoked here instead of never being called at all.
+                if (replay)
+                {
+                    this.InvokeExitHandlers([value!], exitCode);
                 }
             }
 
@@ -100,7 +112,7 @@ namespace Porta.Pty.Linux
             lock (this.lifetimeGate)
             {
                 ObjectDisposedException.ThrowIf(this.isDisposed, this);
-                int error = this.processState.SendSignal(SIGHUP);
+                int error = this.processState.SendSignal(SIGKILL);
                 if (error != 0)
                 {
                     if (error != ESRCH)
@@ -217,7 +229,8 @@ namespace Porta.Pty.Linux
             }
             catch
             {
-                return;
+                // Reaping failed, so the status is unknown: distinct from a clean 0.
+                processExitCode = -1;
             }
 
             Delegate[]? handlers = null;
@@ -229,6 +242,7 @@ namespace Porta.Pty.Linux
                 }
 
                 this.exitEventRaised = true;
+                this.raisedExitCode = processExitCode;
                 handlers = this.processExited?.GetInvocationList();
             }
 
