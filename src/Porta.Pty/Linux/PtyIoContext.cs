@@ -467,6 +467,17 @@ namespace Porta.Pty.Linux
                     return ValueTask.FromException<int>(new ObjectDisposedException("PtyStream"));
                 }
 
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    if (offset > 0)
+                    {
+                        return this.CompleteReadInline(offset);
+                    }
+
+                    this.ReleaseReadInline();
+                    return ValueTask.FromCanceled<int>(cancellationToken);
+                }
+
                 int error;
                 int transferred;
                 try
@@ -504,6 +515,12 @@ namespace Porta.Pty.Linux
                         {
                             this.ReleaseReadInline();
                             return ValueTask.FromException<int>(new ObjectDisposedException("PtyStream"));
+                        }
+
+                        if (cancellationToken.IsCancellationRequested)
+                        {
+                            this.ReleaseReadInline();
+                            return ValueTask.FromCanceled<int>(cancellationToken);
                         }
 
                         try
@@ -568,6 +585,12 @@ namespace Porta.Pty.Linux
                 {
                     this.ReleaseWriteInline();
                     return ValueTask.FromException(new ObjectDisposedException("PtyStream"));
+                }
+
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    this.ReleaseWriteInline();
+                    return ValueTask.FromCanceled(cancellationToken);
                 }
 
                 int error;
