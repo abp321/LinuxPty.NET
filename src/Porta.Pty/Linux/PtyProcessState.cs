@@ -22,6 +22,7 @@ namespace Porta.Pty.Linux
         private readonly Lock reapGate = new();
         private readonly TaskCompletionSource<int> exitCompletion = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
+        private EpollReactor? owningReactor;
         private int pidFileDescriptor;
         private ulong activeToken;
         private LifetimeState lifetimeState;
@@ -55,6 +56,15 @@ namespace Porta.Pty.Linux
         internal bool IsExited => this.exitCompletion.Task.IsCompleted;
 
         internal int ExitCode => Volatile.Read(ref this.exitCode);
+
+        /// <summary>
+        /// Attaches the engine that owns this child's exit observation. Set once, before
+        /// <see cref="TryBeginEpollRegistration"/>, and never changed afterwards.
+        /// </summary>
+        internal void AttachReactor(EpollReactor reactor)
+        {
+            this.owningReactor = reactor;
+        }
 
         internal int SendSignal(int signal)
         {
@@ -447,7 +457,7 @@ namespace Porta.Pty.Linux
                 {
                     try
                     {
-                        EpollReactor.Shared.RegisterFallbackProcess(this);
+                        (this.owningReactor ?? EpollReactor.Shared).RegisterFallbackProcess(this);
                     }
                     catch
                     {

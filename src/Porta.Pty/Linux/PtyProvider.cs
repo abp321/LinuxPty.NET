@@ -24,6 +24,7 @@ namespace Porta.Pty.Linux
 
         internal static async Task<IPtyConnection> StartTerminalAsync(
             PtyOptions options,
+            IPtyEventLoop? eventLoop,
             CancellationToken cancellationToken)
         {
             string?[] terminalArgs = GetExecvpArgs(options);
@@ -65,14 +66,17 @@ namespace Porta.Pty.Linux
                     + $"({GetErrorMessage(result.Error)}), masterFd={result.MasterFd}, pid={result.Pid}");
             }
 
+            EpollReactor? reactor = null;
             PtyProcessState? processState = null;
             PtyIoContext? ioContext = null;
             try
             {
+                reactor = eventLoop is null ? EpollReactor.Shared : new EpollReactor(eventLoop);
                 processState = new PtyProcessState(
                     result.Pid,
                     result.PidFd,
                     result.PidFdError);
+                processState.AttachReactor(reactor);
                 PtyProcessState? pidFdProcess = processState.TryBeginEpollRegistration()
                     ? processState
                     : null;
@@ -80,7 +84,7 @@ namespace Porta.Pty.Linux
                 try
                 {
                     (ioContext, pidFdFailure) = await PtyIoContext
-                        .CreateAsync(result.MasterFd, pidFdProcess)
+                        .CreateAsync(result.MasterFd, pidFdProcess, reactor)
                         .ConfigureAwait(false);
                 }
                 catch when (pidFdProcess is not null)
@@ -100,8 +104,15 @@ namespace Porta.Pty.Linux
 
                 return new PtyConnection(result.MasterFd, result.Pid, ioContext, processState);
             }
-            catch
+            catch (Exception exception)
             {
+                if (eventLoop is not null && reactor is not null)
+                {
+                    // An external engine that never took ownership of anything can never reach
+                    // idle-close, so its backend registrations and descriptors would leak.
+                    reactor.ExternalFail(exception);
+                }
+
                 if (processState is null)
                 {
                     CleanupUntrackedChild(result.MasterFd, result.Pid, result.PidFd);

@@ -149,17 +149,30 @@ namespace Porta.Pty.Linux
             {
                 foreach (IPtyFdRegistration registration in this.registrations.Values)
                 {
-                    registration.Dispose();
+                    TryDispose(registration);
                 }
 
                 this.registrations.Clear();
-                this.timerRegistration.Dispose();
-                this.wakeRegistration.Dispose();
+                TryDispose(this.timerRegistration);
+                TryDispose(this.wakeRegistration);
             }
             finally
             {
                 _ = pty_close(this.timerFd);
                 _ = pty_close(this.wakeFd);
+            }
+        }
+
+        private static void TryDispose(IPtyFdRegistration registration)
+        {
+            try
+            {
+                registration.Dispose();
+            }
+            catch
+            {
+                // Teardown must not be interrupted by a throwing caller Dispose; the native
+                // descriptors are closed in the finally regardless.
             }
         }
 

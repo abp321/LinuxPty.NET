@@ -74,9 +74,9 @@ namespace Porta.Pty.Linux
 
         internal static async Task<(PtyIoContext Context, Exception? ProcessFailure)> CreateAsync(
             int fileDescriptor,
-            PtyProcessState? process)
+            PtyProcessState? process,
+            EpollReactor reactor)
         {
-            EpollReactor reactor = EpollReactor.Shared;
             var context = new PtyIoContext(fileDescriptor, reactor);
             Exception? processFailure =
                 await reactor.RegisterConnectionAsync(context, process).ConfigureAwait(false);

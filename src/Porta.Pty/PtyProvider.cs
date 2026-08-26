@@ -25,6 +25,37 @@ namespace Porta.Pty
             PtyOptions options,
             CancellationToken cancellationToken)
         {
+            return SpawnCoreAsync(PrepareOptions(options), null, cancellationToken);
+        }
+
+        /// <summary>
+        /// Spawns a new process connected to a Linux pseudoterminal, driven by a caller-owned event
+        /// loop instead of the library's own reactor thread. Advanced mode: the loop delivers all
+        /// readiness for this connection, so the library owns no long-lived thread in normal
+        /// operation.
+        /// </summary>
+        /// <param name="options">The options for creating the pseudoterminal.</param>
+        /// <param name="eventLoop">
+        /// The caller-owned loop. It must satisfy every requirement documented on
+        /// <see cref="IPtyEventLoop"/>: serialized readiness callbacks, one-shot re-arming through
+        /// <see cref="IPtyFdRegistration"/>, dispatching until every registration is disposed, and
+        /// no synchronous blocking connection operation on its dispatch thread.
+        /// </param>
+        /// <param name="cancellationToken">
+        /// Cancels a queued spawn, or cleans up a process whose native spawn is already in progress.
+        /// </param>
+        /// <returns>A task containing the spawned connection.</returns>
+        public static Task<IPtyConnection> SpawnAsync(
+            PtyOptions options,
+            IPtyEventLoop eventLoop,
+            CancellationToken cancellationToken)
+        {
+            ArgumentNullException.ThrowIfNull(eventLoop);
+            return SpawnCoreAsync(PrepareOptions(options), eventLoop, cancellationToken);
+        }
+
+        private static PtyOptions PrepareOptions(PtyOptions options)
+        {
             // Validation runs against the snapshot, not the caller's instance, so concurrent
             // mutation cannot slip unchecked values past these guards.
             string app = options.App;
@@ -117,15 +148,16 @@ namespace Porta.Pty
                 throw new PlatformNotSupportedException("LinuxPty.NET supports Linux only.");
             }
 
-            return SpawnCoreAsync(preparedOptions, cancellationToken);
+            return preparedOptions;
         }
 
         private static async Task<IPtyConnection> SpawnCoreAsync(
             PtyOptions preparedOptions,
+            IPtyEventLoop? eventLoop,
             CancellationToken cancellationToken)
         {
             IPtyConnection connection = await Task.Run(
-                () => Linux.PtyProvider.StartTerminalAsync(preparedOptions, cancellationToken));
+                () => Linux.PtyProvider.StartTerminalAsync(preparedOptions, eventLoop, cancellationToken));
 
             if (cancellationToken.IsCancellationRequested)
             {
