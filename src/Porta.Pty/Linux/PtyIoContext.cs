@@ -31,7 +31,10 @@ namespace Porta.Pty.Linux
         private const int InlineStopped = 2;
 
         // Bounds how long a synchronously completing consumer loop can hold a pool worker: every Kth inline completion is delivered asynchronously so the worker re-enters the pool dispatch loop.
-        private const int InlineYieldInterval = 4;
+        private const int InlineYieldInterval = 2;
+
+        // An inline read completes at this much rather than filling the caller's whole buffer, so a streaming consumer reaches the yield interval often enough for interactive work to interleave.
+        private const int InlineFillQuantum = 8 * 1024;
 
         private readonly EpollReactor reactor;
         private readonly Lock stoppedReactorGate = new();
@@ -514,7 +517,7 @@ namespace Porta.Pty.Linux
                     offset += transferred;
 
                     // A zero transfer is EOF for this caller only; endOfFile is reactor-owned.
-                    if (transferred == 0 || offset == buffer.Length)
+                    if (transferred == 0 || offset == buffer.Length || offset >= InlineFillQuantum)
                     {
                         return this.CompleteReadInline(offset);
                     }
