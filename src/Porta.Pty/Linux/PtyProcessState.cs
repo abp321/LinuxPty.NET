@@ -74,12 +74,12 @@ namespace Porta.Pty.Linux
 
                     // Once a pidfd has identified the child, falling back to kill(pid)
                     // could target a reused PID after external reaping.
-                    return Marshal.GetLastWin32Error();
+                    return Marshal.GetLastPInvokeError();
                 }
 
                 return pty_kill(this.pid, signal) == 0
                     ? 0
-                    : Marshal.GetLastWin32Error();
+                    : Marshal.GetLastPInvokeError();
             }
         }
 

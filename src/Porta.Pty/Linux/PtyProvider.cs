@@ -7,6 +7,7 @@ namespace Porta.Pty.Linux
     using System.Collections;
     using System.Collections.Generic;
     using System.Linq;
+    using System.Runtime.InteropServices;
     using System.Threading;
     using System.Threading.Tasks;
     using static Porta.Pty.Linux.NativeMethods;
@@ -151,7 +152,7 @@ namespace Porta.Pty.Linux
                 return $"not an errno ({errno}); the native result struct did not carry one";
             }
 
-            return new System.ComponentModel.Win32Exception(errno).Message;
+            return Marshal.GetPInvokeErrorMessage(errno);
         }
 
         private static void CleanupUntrackedChild(int masterFd, int pid, int pidFd)

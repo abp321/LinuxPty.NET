@@ -5,7 +5,7 @@ namespace Porta.Pty.Linux
 {
     using System;
     using System.Runtime.InteropServices;
-    using System.Runtime.InteropServices.Marshalling;
+    using System.Text;
 
     internal static partial class NativeMethods
     {
@@ -82,17 +82,43 @@ namespace Porta.Pty.Linux
             public uint Reserved;
         }
 
-        // The source-generated marshaller cannot preserve null-terminated UTF-8
-        // char** argv and environment arrays without custom marshalling.
-        [DllImport(LibPortaPty)]
-        internal static extern PtySpawnResult pty_spawn(
-            [MarshalAs(UnmanagedType.LPStr)] string file,
-            [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPStr)] string?[] argv,
-            [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPStr)] string?[] inheritedEnvironment,
-            [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPStr)] string?[]? environmentMutations,
-            [MarshalAs(UnmanagedType.LPStr)] string? workingDir,
+        internal static unsafe PtySpawnResult pty_spawn(
+            string file,
+            string?[] argv,
+            string?[] inheritedEnvironment,
+            string?[]? environmentMutations,
+            string? workingDir,
             ushort rows,
-            ushort cols);
+            ushort cols)
+        {
+            byte** nativeArgv = null;
+            byte** nativeInherited = null;
+            byte** nativeMutations = null;
+            try
+            {
+                nativeArgv = AllocateStringArray(argv);
+                nativeInherited = AllocateStringArray(inheritedEnvironment);
+                if (environmentMutations is not null)
+                {
+                    nativeMutations = AllocateStringArray(environmentMutations);
+                }
+
+                return PtySpawnCore(
+                    file,
+                    nativeArgv,
+                    nativeInherited,
+                    nativeMutations,
+                    workingDir,
+                    rows,
+                    cols);
+            }
+            finally
+            {
+                FreeStringArray(nativeMutations, environmentMutations?.Length ?? 0);
+                FreeStringArray(nativeInherited, inheritedEnvironment.Length);
+                FreeStringArray(nativeArgv, argv.Length);
+            }
+        }
 
         [LibraryImport(LibPortaPty, SetLastError = true)]
         internal static partial int pty_resize(int masterFd, ushort rows, ushort cols);
@@ -130,9 +156,9 @@ namespace Porta.Pty.Linux
             uint interests);
 
         [LibraryImport(LibPortaPty)]
-        internal static partial int pty_reactor_wait(
+        internal static unsafe partial int pty_reactor_wait(
             int epollFd,
-            [Out, MarshalUsing(CountElementName = nameof(capacity))] PtyReactorEvent[] events,
+            PtyReactorEvent* events,
             int capacity,
             out int count);
 
@@ -155,5 +181,63 @@ namespace Porta.Pty.Linux
             IntPtr buffer,
             int length,
             out int transferred);
+
+        [LibraryImport(LibPortaPty, EntryPoint = "pty_spawn", StringMarshalling = StringMarshalling.Utf8)]
+        private static unsafe partial PtySpawnResult PtySpawnCore(
+            string file,
+            byte** argv,
+            byte** inheritedEnvironment,
+            byte** environmentMutations,
+            string? workingDir,
+            ushort rows,
+            ushort cols);
+
+        private static unsafe byte** AllocateStringArray(string?[] values)
+        {
+            // Zeroed so a partially built array is still safe to walk and free.
+            byte** native = (byte**)NativeMemory.AllocZeroed((nuint)values.Length, (nuint)sizeof(byte*));
+            try
+            {
+                for (int index = 0; index < values.Length; index++)
+                {
+                    if (values[index] is { } value)
+                    {
+                        native[index] = AllocateUtf8(value);
+                    }
+                }
+            }
+            catch
+            {
+                // The caller cannot free an array it never received a pointer to.
+                FreeStringArray(native, values.Length);
+                throw;
+            }
+
+            return native;
+        }
+
+        private static unsafe byte* AllocateUtf8(string value)
+        {
+            int byteCount = Encoding.UTF8.GetByteCount(value);
+            byte* buffer = (byte*)NativeMemory.Alloc((nuint)byteCount + 1);
+            int written = Encoding.UTF8.GetBytes(value, new Span<byte>(buffer, byteCount));
+            buffer[written] = 0;
+            return buffer;
+        }
+
+        private static unsafe void FreeStringArray(byte** native, int length)
+        {
+            if (native is null)
+            {
+                return;
+            }
+
+            for (int index = 0; index < length; index++)
+            {
+                NativeMemory.Free(native[index]);
+            }
+
+            NativeMemory.Free(native);
+        }
     }
 }

@@ -7,6 +7,7 @@ namespace Porta.Pty.Linux
     using System.Collections.Generic;
     using System.ComponentModel;
     using System.IO;
+    using System.Runtime.InteropServices;
     using System.Threading;
     using System.Threading.Tasks;
     using static Porta.Pty.Linux.NativeMethods;
@@ -32,12 +33,12 @@ namespace Porta.Pty.Linux
         private readonly Dictionary<ulong, PtyProcessState> activeProcesses = new();
         private readonly HashSet<PtyIoContext> contexts = new();
         private readonly HashSet<PtyProcessState> processes = new();
-        private readonly PtyReactorEvent[] events = new PtyReactorEvent[EventCapacity];
+        private readonly unsafe PtyReactorEvent* events;
         private readonly Thread thread;
         private long nextToken;
         private Exception? fatalError;
 
-        private EpollReactor()
+        private unsafe EpollReactor()
         {
             int error = pty_reactor_create(WakeToken, out this.epollFd, out this.wakeFd);
             if (error != 0)
@@ -53,10 +54,13 @@ namespace Porta.Pty.Linux
 
             try
             {
+                this.events = (PtyReactorEvent*)NativeMemory.Alloc(
+                    (nuint)(EventCapacity * sizeof(PtyReactorEvent)));
                 this.thread.Start();
             }
             catch
             {
+                NativeMemory.Free(this.events);
                 pty_close(this.wakeFd);
                 pty_close(this.epollFd);
                 throw;
@@ -313,7 +317,7 @@ namespace Porta.Pty.Linux
             }
         }
 
-        private void Run()
+        private unsafe void Run()
         {
             try
             {
@@ -324,7 +328,7 @@ namespace Porta.Pty.Linux
                     int error = pty_reactor_wait(
                         this.epollFd,
                         this.events,
-                        this.events.Length,
+                        EventCapacity,
                         out int count);
                     if (error != 0)
                     {
@@ -430,6 +434,7 @@ namespace Porta.Pty.Linux
             }
             finally
             {
+                NativeMemory.Free(this.events);
                 _ = pty_close(this.wakeFd);
                 _ = pty_close(this.epollFd);
             }

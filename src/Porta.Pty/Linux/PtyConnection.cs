@@ -135,7 +135,7 @@ namespace Porta.Pty.Linux
                 if (pty_resize(this.controller, (ushort)rows, (ushort)cols) == -1)
                 {
                     throw new InvalidOperationException(
-                        $"Resizing terminal failed with error {Marshal.GetLastWin32Error()}");
+                        $"Resizing terminal failed with error {Marshal.GetLastPInvokeError()}");
                 }
             }
         }
