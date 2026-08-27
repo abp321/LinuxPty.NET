@@ -15,7 +15,9 @@ namespace Porta.Pty
     /// run after it returns. The library calls <see cref="UpdateInterests"/> and
     /// <see cref="IDisposable.Dispose"/> only from within the loop's serialized callback context or
     /// on a registration that has never been armed, so implementations need no additional
-    /// cross-thread fencing.
+    /// cross-thread fencing. Arming a registration whose descriptor is already ready must deliver
+    /// that readiness promptly; the library re-arms instead of re-probing and depends on no
+    /// readiness being lost.
     /// </remarks>
     public interface IPtyFdRegistration : IDisposable
     {

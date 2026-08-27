@@ -224,7 +224,12 @@ namespace Porta.Pty.Linux
 
         internal void PostContextCommand(PtyIoContext context, Action action)
         {
-            this.Post(new ReactorCommand(context, action));
+            this.Post(new ReactorCommand(context, ReactorCommandKind.General, null, action));
+        }
+
+        internal void PostCommand(PtyIoContext context, ReactorCommandKind kind, object? state)
+        {
+            this.Post(new ReactorCommand(context, kind, state, null));
         }
 
         internal Task CloseSideAsync(PtyIoContext context, bool readSide)
@@ -482,7 +487,7 @@ namespace Porta.Pty.Linux
 
         private void Post(Action command)
         {
-            this.Post(new ReactorCommand(null, command));
+            this.Post(new ReactorCommand(null, ReactorCommandKind.General, null, command));
         }
 
         private void Post(ReactorCommand command)
@@ -670,11 +675,19 @@ namespace Porta.Pty.Linux
         {
             if (command.Context is { } context)
             {
-                this.ExecuteContextAction(context, command.Action);
+                if (command.Kind == ReactorCommandKind.General)
+                {
+                    this.ExecuteContextAction(context, command.Action!);
+                }
+                else
+                {
+                    this.ExecuteTypedContextCommand(context, command.Kind, command.State);
+                }
+
                 return;
             }
 
-            command.Action();
+            command.Action!();
         }
 
         private void DispatchReadyOnReactor(PtyIoContext context, uint events)
@@ -707,6 +720,28 @@ namespace Porta.Pty.Linux
             try
             {
                 action();
+            }
+            catch (Exception exception)
+            {
+                this.Deactivate(context, ignoreErrors: true);
+                context.FailOnReactor(exception);
+            }
+        }
+
+        private void ExecuteTypedContextCommand(
+            PtyIoContext context,
+            ReactorCommandKind kind,
+            object? state)
+        {
+            if (context.IsStoppedOnReactor)
+            {
+                context.ExecuteCommandOnReactor(kind, state);
+                return;
+            }
+
+            try
+            {
+                context.ExecuteCommandOnReactor(kind, state);
             }
             catch (Exception exception)
             {
@@ -907,7 +942,11 @@ namespace Porta.Pty.Linux
             return token;
         }
 
-        private readonly record struct ReactorCommand(PtyIoContext? Context, Action Action);
+        private readonly record struct ReactorCommand(
+            PtyIoContext? Context,
+            ReactorCommandKind Kind,
+            object? State,
+            Action? Action);
 
         private readonly record struct FallbackReapResult(
             PtyProcessState Process,

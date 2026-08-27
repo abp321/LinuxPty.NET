@@ -120,7 +120,7 @@ namespace Porta.Pty.Linux
             try
             {
                 operation.RegisterCancellation();
-                this.reactor.PostContextCommand(this, () => this.EnqueueReadOnReactor(operation));
+                this.reactor.PostCommand(this, ReactorCommandKind.EnqueueRead, operation);
             }
             catch (Exception exception)
             {
@@ -166,7 +166,7 @@ namespace Porta.Pty.Linux
             try
             {
                 operation.RegisterCancellation();
-                this.reactor.PostContextCommand(this, () => this.EnqueueWriteOnReactor(operation));
+                this.reactor.PostCommand(this, ReactorCommandKind.EnqueueWrite, operation);
             }
             catch (Exception exception)
             {
@@ -247,6 +247,42 @@ namespace Porta.Pty.Linux
             }
 
             this.UpdateInterestOnReactor();
+        }
+
+        internal void ExecuteCommandOnReactor(ReactorCommandKind kind, object? state)
+        {
+            switch (kind)
+            {
+                case ReactorCommandKind.EnqueueRead:
+                    this.EnqueueReadOnReactor((ReadOperation)state!);
+                    break;
+                case ReactorCommandKind.EnqueueReadFallback:
+                    this.EnqueueReadFallbackOnReactor((ReadOperation)state!);
+                    break;
+                case ReactorCommandKind.EnqueueWrite:
+                    this.EnqueueWriteOnReactor((WriteOperation)state!);
+                    break;
+                case ReactorCommandKind.EnqueueWriteFallback:
+                    this.EnqueueWriteFallbackOnReactor((WriteOperation)state!);
+                    break;
+                case ReactorCommandKind.CancelRead:
+                    this.CancelReadOnReactor((ReadOperation)state!);
+                    break;
+                case ReactorCommandKind.CancelWrite:
+                    this.CancelWriteOnReactor((WriteOperation)state!);
+                    break;
+                case ReactorCommandKind.KickReads:
+                    this.UpdateInterestOnReactor();
+                    break;
+                case ReactorCommandKind.KickWrites:
+                    // The write half keeps its probe: a parked write is cold, so the extra
+                    // syscall costs nothing that the read path's arm-only kick saves.
+                    this.ProcessWritesOnReactor(0);
+                    this.UpdateInterestOnReactor();
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(kind));
+            }
         }
 
         internal void CloseSideOnReactor(bool readSide)
@@ -353,13 +389,10 @@ namespace Porta.Pty.Linux
                 return;
             }
 
-            bool wasEmpty = this.readsHead is null;
+            // Arm-only, no probe: the caller already saw EAGAIN, master readiness is level-triggered,
+            // and sticky HUP or ERR is delivered on the arm regardless of the mask, so the first
+            // readiness dispatch classifies EIO against hangupSeen.
             this.AddRead(operation);
-            if (wasEmpty)
-            {
-                this.ProcessReadsOnReactor(0);
-            }
-
             this.UpdateInterestOnReactor();
         }
 
@@ -414,12 +447,7 @@ namespace Porta.Pty.Linux
         {
             try
             {
-                this.reactor.PostContextCommand(this, () =>
-                {
-                    this.RemoveRead(operation);
-                    operation.CompleteCanceled();
-                    this.UpdateInterestOnReactor();
-                });
+                this.reactor.PostCommand(this, ReactorCommandKind.CancelRead, operation);
             }
             catch
             {
@@ -431,17 +459,26 @@ namespace Porta.Pty.Linux
         {
             try
             {
-                this.reactor.PostContextCommand(this, () =>
-                {
-                    this.RemoveWrite(operation);
-                    operation.CompleteCanceled();
-                    this.UpdateInterestOnReactor();
-                });
+                this.reactor.PostCommand(this, ReactorCommandKind.CancelWrite, operation);
             }
             catch
             {
                 // A stopped reactor fails the context and any abandoned add command.
             }
+        }
+
+        private void CancelReadOnReactor(ReadOperation operation)
+        {
+            this.RemoveRead(operation);
+            operation.CompleteCanceled();
+            this.UpdateInterestOnReactor();
+        }
+
+        private void CancelWriteOnReactor(WriteOperation operation)
+        {
+            this.RemoveWrite(operation);
+            operation.CompleteCanceled();
+            this.UpdateInterestOnReactor();
         }
 
         private void SignalReadInlineReleased()
@@ -581,7 +618,7 @@ namespace Porta.Pty.Linux
             try
             {
                 operation.RegisterCancellation();
-                this.reactor.PostContextCommand(this, () => this.EnqueueReadFallbackOnReactor(operation));
+                this.reactor.PostCommand(this, ReactorCommandKind.EnqueueReadFallback, operation);
             }
             catch (Exception exception)
             {
@@ -636,7 +673,7 @@ namespace Porta.Pty.Linux
             try
             {
                 operation.RegisterCancellation();
-                this.reactor.PostContextCommand(this, () => this.EnqueueWriteFallbackOnReactor(operation));
+                this.reactor.PostCommand(this, ReactorCommandKind.EnqueueWriteFallback, operation);
             }
             catch (Exception exception)
             {
@@ -689,11 +726,7 @@ namespace Porta.Pty.Linux
 
             try
             {
-                this.reactor.PostContextCommand(this, () =>
-                {
-                    this.ProcessReadsOnReactor(0);
-                    this.UpdateInterestOnReactor();
-                });
+                this.reactor.PostCommand(this, ReactorCommandKind.KickReads, null);
             }
             catch
             {
@@ -710,11 +743,7 @@ namespace Porta.Pty.Linux
 
             try
             {
-                this.reactor.PostContextCommand(this, () =>
-                {
-                    this.ProcessWritesOnReactor(0);
-                    this.UpdateInterestOnReactor();
-                });
+                this.reactor.PostCommand(this, ReactorCommandKind.KickWrites, null);
             }
             catch
             {
@@ -759,7 +788,8 @@ namespace Porta.Pty.Linux
                 }
             }
 
-            this.ProcessReadsOnReactor(0);
+            // Arm-only for the same reason as EnqueueReadOnReactor: the inline read already
+            // consumed the readiness it saw, and re-arming redelivers whatever remains.
             this.UpdateInterestOnReactor();
         }
 
