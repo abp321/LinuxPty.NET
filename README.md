@@ -24,17 +24,8 @@ The NuGet package ID is `LinuxPty.NET`. The public API lives in the `Porta.Pty` 
 
 ## Installation
 
-LinuxPty.NET is distributed through GitHub Packages, which requires an authenticated NuGet source even for public packages. Configure the `abp321` source with a GitHub token that has `read:packages`, then install:
-
 ```bash
-dotnet nuget add source \
-  --username YOUR_GITHUB_USERNAME \
-  --password YOUR_GITHUB_TOKEN \
-  --store-password-in-clear-text \
-  --name github-abp321 \
-  https://nuget.pkg.github.com/abp321/index.json
-
-dotnet add package LinuxPty.NET --version VERSION --source github-abp321
+dotnet add package LinuxPty.NET
 ```
 
 Published versions are deterministic: each commit on `main` maps to `1.0.<repository commit count>`.
