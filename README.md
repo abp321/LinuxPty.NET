@@ -2,10 +2,11 @@
 
 LinuxPty.NET is a Linux-only pseudoterminal (PTY) library for .NET 10. It spawns a process under a fresh PTY and exposes read and write streams plus asynchronous exit observation. Native assets ship for glibc-based `linux-x64` and `linux-arm64`; musl-based distributions (such as Alpine) are not supported.
 
+[![NuGet](https://img.shields.io/nuget/v/LinuxPty.NET.svg)](https://www.nuget.org/packages/LinuxPty.NET)
 [![Publish package](https://github.com/abp321/LinuxPty.NET/actions/workflows/publish-package.yml/badge.svg?branch=main)](https://github.com/abp321/LinuxPty.NET/actions/workflows/publish-package.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/abp321/LinuxPty.NET/blob/main/LICENSE)
 
-The NuGet package ID is `LinuxPty.NET`. The public API lives in the `Porta.Pty` namespace, inherited from the upstream project.
+The public API lives in the `Porta.Pty` namespace and the shipped assembly is `Porta.Pty.dll`, both inherited from the upstream project.
 
 ## Features
 
@@ -28,8 +29,6 @@ The NuGet package ID is `LinuxPty.NET`. The public API lives in the `Porta.Pty` 
 dotnet add package LinuxPty.NET
 ```
 
-Published versions are deterministic: each commit on `main` maps to `1.0.<repository commit count>`.
-
 ## Usage
 
 ```csharp
@@ -51,13 +50,21 @@ await using IPtyConnection terminal = await PtyProvider.SpawnAsync(
     options,
     CancellationToken.None);
 
-byte[] command = Encoding.UTF8.GetBytes("echo hello\r");
-await terminal.WriterStream.WriteAsync(command);
+byte[] commands = Encoding.UTF8.GetBytes("echo hello\rexit\r");
+await terminal.WriterStream.WriteAsync(commands);
 
 byte[] buffer = new byte[4096];
-int count = await terminal.ReaderStream.ReadAsync(buffer);
-Console.WriteLine(Encoding.UTF8.GetString(buffer, 0, count));
+int count;
+while ((count = await terminal.ReaderStream.ReadAsync(buffer)) > 0)
+{
+    Console.Write(Encoding.UTF8.GetString(buffer, 0, count));
+}
+
+int exitCode = await terminal.WaitForExitAsync(CancellationToken.None);
+Console.WriteLine($"Exited with {exitCode}.");
 ```
+
+A terminal echoes what is typed into it, so the output contains the two commands as well as `hello`. The read loop ends when the child exits and the kernel closes the slave side, which the reader stream reports as end of stream. Decode with a stateful `Decoder` rather than `Encoding.UTF8.GetString` if the output can contain multi-byte characters, since a read can split one across two buffers.
 
 `IPtyConnection` also exposes `Resize(cols, rows)`, `Kill()` (immediate `SIGKILL`), the `Pid` and `ExitCode` properties, and a `ProcessExited` event. The event is delivered exactly once per handler, including handlers subscribed after the child has already exited.
 
@@ -73,7 +80,7 @@ Console.WriteLine(Encoding.UTF8.GetString(buffer, 0, count));
 
 **External event loop (advanced).** `PtyProvider.SpawnAsync(options, eventLoop, cancellationToken)` drives the connection through a caller-owned `IPtyEventLoop` instead of the library's reactor thread. Registration is one-shot: after a readiness callback fires, that registration is disarmed and delivers nothing further until the library re-arms it through `IPtyFdRegistration.UpdateInterests`; a registration created with `PtyFdInterests.None` starts disarmed. Arming a registration whose descriptor is already ready must deliver readiness immediately, and `Dispose` unregisters the descriptor so that no callback runs after it returns. The loop must serialize readiness callbacks so that no two ever run concurrently, and it must keep dispatching until every registration it handed out has been disposed, because disposal and child reaping complete through callbacks. Synchronous blocking connection operations (`Dispose`, `WaitForExit`, and the synchronous stream `Read` and `Write`) must never run on the loop's dispatch thread: their completion depends on callbacks only that thread can deliver.
 
-**Performance posture.** The library favors interactivity and bounded resource use over peak throughput, and two internal choices record deliberate tradeoffs. First, bulk transfers move in small quanta: an operation the descriptor can satisfy immediately completes after a single native syscall on the calling thread, and a parked operation completes after a few KB per reactor visit, so concurrent interactive traffic stays responsive while other connections stream; measured on an 8-core host, this configuration streams 10 concurrent connections at about 40 percent above the pre-quanta design while keeping a loaded interactive echo at sub-millisecond medians. Under full load a small tail of round-trips (roughly the worst percentile) still waits on an OS scheduling quantum; that tail comes from genuine CPU saturation, not from library queuing, and shrinking it further would require giving throughput back. Second, `SpawnAsync` does not return until the child's `exec` has been confirmed over the control channel, so a mistyped `App` or `Cwd` surfaces as an exception carrying the real errno instead of a healthy-looking connection that dies immediately. That confirmation costs a few hundred microseconds per spawn relative to fire-and-forget spawning; it is the price of the error contract and is kept intentionally.
+**Performance posture.** The library favors interactivity and bounded resource use over peak throughput, and two internal choices record deliberate tradeoffs. First, bulk transfers move in small quanta: an operation the descriptor can satisfy immediately completes after a single native syscall on the calling thread, and a parked operation completes after a few KB per reactor visit, so a connection streaming bulk data cannot starve concurrent interactive traffic. On an 8-core host, ten concurrent streaming connections still leave a loaded interactive echo at sub-millisecond medians. Under full load a small tail of round-trips (roughly the worst percentile) waits on an OS scheduling quantum; that tail comes from genuine CPU saturation, not from library queuing, and shrinking it further would require giving throughput back. Second, `SpawnAsync` does not return until the child's `exec` has been confirmed over the control channel, so a mistyped `App` or `Cwd` surfaces as an exception carrying the real errno instead of a healthy-looking connection that dies immediately. That confirmation costs a few hundred microseconds per spawn relative to fire-and-forget spawning; it is the price of the error contract and is kept intentionally.
 
 ## Building from source
 
@@ -87,8 +94,12 @@ dotnet build LinuxPty.NET.slnx -c Release --no-restore
 
 The native build produces the asset for the machine it runs on. Release packages containing both RID assets are built and published by CI, so building from source is only needed for development.
 
+## Versioning
+
+Each published version is `1.0.<repository commit count>` measured at the commit it was built from, so versions are sequential rather than semantic: a higher patch number means a later commit, not a compatibility statement. A push carrying several commits publishes once, so the sequence can skip values.
+
 ## Provenance and license
 
-LinuxPty.NET is an independent Linux-focused fork of [Porta.Pty](https://github.com/tomlm/Porta.Pty) by Tom Laird-McConnell, which itself derives from Microsoft's [Pty.Net](https://github.com/microsoft/vs-pty.net). Original copyright notices are preserved in the source headers and in [LICENSE](LICENSE) (MIT).
+LinuxPty.NET is an independent Linux-focused fork of [Porta.Pty](https://github.com/tomlm/Porta.Pty) by Tom Laird-McConnell, which itself derives from Microsoft's [Pty.Net](https://github.com/microsoft/vs-pty.net). Original copyright notices are preserved in the source headers and in [LICENSE](https://github.com/abp321/LinuxPty.NET/blob/main/LICENSE) (MIT).
 
 LinuxPty.NET is not an official Porta.Pty or Microsoft distribution.
