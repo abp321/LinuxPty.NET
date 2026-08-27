@@ -886,8 +886,14 @@ namespace Porta.Pty.Linux
                     continue;
                 }
 
+                // Cap each syscall at the remaining quantum, not just the accumulated total: a
+                // 64 KB caller buffer would otherwise pull a full dispatch budget through the
+                // reactor in one read, which under load turns the shared reactor into the data
+                // plane and stretches every queued command's handoff behind it.
                 int count = Math.Min(
-                    operation.Buffer.Length - operation.Offset,
+                    Math.Min(
+                        operation.Buffer.Length - operation.Offset,
+                        ReactorFillQuantum - operation.Offset),
                     MaxBytesPerDispatch - bytesProcessed);
                 int error;
                 int transferred;
