@@ -222,11 +222,6 @@ namespace Porta.Pty.Linux
             });
         }
 
-        internal void PostContextCommand(PtyIoContext context, Action action)
-        {
-            this.Post(new ReactorCommand(context, ReactorCommandKind.General, null, action));
-        }
-
         internal void PostCommand(PtyIoContext context, ReactorCommandKind kind, object? state)
         {
             this.Post(new ReactorCommand(context, kind, state, null));
@@ -675,15 +670,7 @@ namespace Porta.Pty.Linux
         {
             if (command.Context is { } context)
             {
-                if (command.Kind == ReactorCommandKind.General)
-                {
-                    this.ExecuteContextAction(context, command.Action!);
-                }
-                else
-                {
-                    this.ExecuteTypedContextCommand(context, command.Kind, command.State);
-                }
-
+                this.ExecuteTypedContextCommand(context, command.Kind, command.State);
                 return;
             }
 
