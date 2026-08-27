@@ -398,9 +398,9 @@ namespace Porta.Pty.Linux
                 return;
             }
 
-            // Correctness rests on the arm alone: the caller already saw EAGAIN, master readiness is level-triggered,
-            // and sticky HUP or ERR is delivered on the arm regardless of the mask, so the first
-            // readiness dispatch classifies EIO against hangupSeen.
+            // Correctness rests on the arm alone: master readiness is level-triggered, and sticky
+            // HUP or ERR is delivered on the arm regardless of the mask, so the first readiness
+            // dispatch classifies EIO against hangupSeen.
             this.AddRead(operation);
             if (Stopwatch.GetTimestamp() - operation.PostedTimestamp >= StaleHandoffTicks)
             {
