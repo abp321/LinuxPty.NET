@@ -50,6 +50,10 @@ jobs:
   publish:
     needs: [version, build]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
 
     steps:
       - name: Setup .NET
@@ -68,4 +72,17 @@ jobs:
           dotnet nuget push "./artifacts/nuget/*.nupkg" \
             --api-key "${{ secrets.GITHUB_TOKEN }}" \
             --source "https://nuget.pkg.github.com/abp321/index.json" \
+            --skip-duplicate
+
+      - name: Log in to NuGet.org
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          user: abp321
+
+      - name: Publish to NuGet.org
+        run: |
+          dotnet nuget push "./artifacts/nuget/*.nupkg" \
+            --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" \
+            --source "https://api.nuget.org/v3/index.json" \
             --skip-duplicate
