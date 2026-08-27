@@ -4,6 +4,7 @@
 namespace Porta.Pty.Linux
 {
     using System;
+    using System.Diagnostics;
     using System.IO;
     using System.Threading;
     using System.Threading.Tasks;
@@ -22,6 +23,12 @@ namespace Porta.Pty.Linux
         private const int MaxBytesPerDispatch = 64 * 1024;
         private const int MaxCallsPerDispatch = 16;
 
+        // An enqueue command that waited at least this long behind other reactor work probably has
+        // data already buffered (the reactor was busy), so one immediate probe read beats a full
+        // epoll round trip; a fresh command means an idle reactor and an almost-certainly-empty
+        // descriptor, where the probe is a wasted syscall.
+        private const int StaleHandoffMicroseconds = 80;
+
         // A parked operation completes at this much so one busy descriptor cannot hold the reactor for a full 64 KB fill while a small ready read waits; the consumer's next read drains the rest inline.
         private const int ReactorFillQuantum = 4 * 1024;
 
@@ -29,6 +36,8 @@ namespace Porta.Pty.Linux
         private const int InlineFree = 0;
         private const int InlineHeld = 1;
         private const int InlineStopped = 2;
+
+        private static readonly long StaleHandoffTicks = Stopwatch.Frequency * StaleHandoffMicroseconds / 1_000_000;
 
         private readonly EpollReactor reactor;
         private readonly Lock stoppedReactorGate = new();
@@ -389,10 +398,15 @@ namespace Porta.Pty.Linux
                 return;
             }
 
-            // Arm-only, no probe: the caller already saw EAGAIN, master readiness is level-triggered,
+            // Correctness rests on the arm alone: the caller already saw EAGAIN, master readiness is level-triggered,
             // and sticky HUP or ERR is delivered on the arm regardless of the mask, so the first
             // readiness dispatch classifies EIO against hangupSeen.
             this.AddRead(operation);
+            if (Stopwatch.GetTimestamp() - operation.PostedTimestamp >= StaleHandoffTicks)
+            {
+                this.ProcessReadsOnReactor(0);
+            }
+
             this.UpdateInterestOnReactor();
         }
 
@@ -788,8 +802,13 @@ namespace Porta.Pty.Linux
                 }
             }
 
-            // Arm-only for the same reason as EnqueueReadOnReactor: the inline read already
-            // consumed the readiness it saw, and re-arming redelivers whatever remains.
+            // The arm alone suffices for the same reason as EnqueueReadOnReactor: the inline read
+            // already consumed the readiness it saw, and re-arming redelivers whatever remains.
+            if (Stopwatch.GetTimestamp() - operation.PostedTimestamp >= StaleHandoffTicks)
+            {
+                this.ProcessReadsOnReactor(0);
+            }
+
             this.UpdateInterestOnReactor();
         }
 
@@ -1370,9 +1389,12 @@ namespace Porta.Pty.Linux
                 : base(context, cancellationToken)
             {
                 this.Buffer = buffer;
+                this.PostedTimestamp = Stopwatch.GetTimestamp();
             }
 
             internal Memory<byte> Buffer { get; }
+
+            internal long PostedTimestamp { get; }
 
             internal int Offset { get; set; }
 
