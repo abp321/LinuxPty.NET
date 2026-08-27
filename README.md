@@ -2,7 +2,6 @@
 
 LinuxPty.NET is a Linux-only pseudoterminal (PTY) library for .NET 10. It spawns a process under a fresh PTY and exposes read and write streams plus asynchronous exit observation. Native assets ship for glibc-based `linux-x64` and `linux-arm64`; musl-based distributions (such as Alpine) are not supported.
 
-[![NuGet](https://img.shields.io/nuget/v/LinuxPty.NET.svg)](https://www.nuget.org/packages/LinuxPty.NET)
 [![Publish package](https://github.com/abp321/LinuxPty.NET/actions/workflows/publish-package.yml/badge.svg?branch=main)](https://github.com/abp321/LinuxPty.NET/actions/workflows/publish-package.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/abp321/LinuxPty.NET/blob/main/LICENSE)
 
@@ -25,8 +24,17 @@ The public API lives in the `Porta.Pty` namespace and the shipped assembly is `P
 
 ## Installation
 
+LinuxPty.NET is distributed through GitHub Packages, which requires an authenticated NuGet source even for public packages. Configure the `abp321` source with a GitHub token that has `read:packages`, then install:
+
 ```bash
-dotnet add package LinuxPty.NET
+dotnet nuget add source \
+  --username YOUR_GITHUB_USERNAME \
+  --password YOUR_GITHUB_TOKEN \
+  --store-password-in-clear-text \
+  --name github-abp321 \
+  https://nuget.pkg.github.com/abp321/index.json
+
+dotnet add package LinuxPty.NET --source github-abp321
 ```
 
 ## Usage
