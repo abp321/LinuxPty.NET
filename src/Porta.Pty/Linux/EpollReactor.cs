@@ -38,6 +38,7 @@ namespace Porta.Pty.Linux
         private readonly HashSet<PtyIoContext> contexts = new();
         private readonly HashSet<PtyProcessState> processes = new();
         private readonly List<PtyProcessState> fallbackProcesses = new();
+        private readonly List<FallbackReapResult> fallbackReapedBatch = new();
         private readonly ReactorCommand[] drainBatch = new ReactorCommand[MaxCommandsPerDrain];
         private readonly unsafe PtyReactorEvent* events;
         private readonly Thread? thread;
@@ -47,9 +48,11 @@ namespace Porta.Pty.Linux
         private int drainBatchNext;
         private int fallbackPollIntervalMilliseconds = FallbackBasePollMilliseconds;
         private int fallbackScanCursor;
+        private int fallbackScanRoundRemaining;
         private bool fallbackTimerArmed;
         private long fallbackTimerDeadline;
         private bool fallbackRegistered;
+        private bool fallbackRoundReaped;
         private Exception? fatalError;
 
         private unsafe EpollReactor(IReactorBackend backend)
@@ -213,15 +216,24 @@ namespace Porta.Pty.Linux
                 }
 
                 this.fallbackProcesses.Add(process);
-                this.fallbackRegistered = true;
-                this.fallbackPollIntervalMilliseconds = FallbackBasePollMilliseconds;
+                this.ScheduleFallbackScanSoon();
+            });
+        }
 
-                // A pending scan deadline may be pulled earlier, never pushed later.
-                if (!this.fallbackTimerArmed
-                    || Environment.TickCount64 + FallbackBasePollMilliseconds < this.fallbackTimerDeadline)
+        /// <summary>
+        /// Pulls the next fallback scan forward, so a child that was just signalled is observed
+        /// without waiting out the idle backoff.
+        /// </summary>
+        internal void PromptFallbackScan()
+        {
+            this.Post(() =>
+            {
+                if (this.fallbackProcesses.Count == 0)
                 {
-                    this.ArmFallbackTimer(FallbackBasePollMilliseconds);
+                    return;
                 }
+
+                this.ScheduleFallbackScanSoon();
             });
         }
 
@@ -816,7 +828,15 @@ namespace Porta.Pty.Linux
         private void ScanFallbackProcesses()
         {
             int count = this.fallbackProcesses.Count;
-            int visits = Math.Min(count, FallbackScanBatchLimit);
+
+            // A round covers the population at round start; a shrunken population clamps it, and
+            // children registered mid-round wait for the next round.
+            if (this.fallbackScanRoundRemaining <= 0 || this.fallbackScanRoundRemaining > count)
+            {
+                this.fallbackScanRoundRemaining = count;
+            }
+
+            int visits = Math.Min(this.fallbackScanRoundRemaining, FallbackScanBatchLimit);
             if (this.fallbackScanCursor >= count)
             {
                 this.fallbackScanCursor = 0;
@@ -824,20 +844,19 @@ namespace Porta.Pty.Linux
 
             // The list is not mutated while it is being walked, so the visits distinct
             // offsets from the cursor map to visits distinct entries.
-            var reaped = new List<FallbackReapResult>();
             for (int visited = 0; visited < visits; visited++)
             {
                 PtyProcessState process =
                     this.fallbackProcesses[(this.fallbackScanCursor + visited) % count];
                 if (process.TryReap(out int exitCode, out Exception? failure))
                 {
-                    reaped.Add(new FallbackReapResult(process, exitCode, failure));
+                    this.fallbackReapedBatch.Add(new FallbackReapResult(process, exitCode, failure));
                 }
             }
 
             this.fallbackScanCursor += visits;
 
-            foreach (FallbackReapResult result in reaped)
+            foreach (FallbackReapResult result in this.fallbackReapedBatch)
             {
                 int index = this.fallbackProcesses.IndexOf(result.Process);
                 int last = this.fallbackProcesses.Count - 1;
@@ -851,6 +870,15 @@ namespace Porta.Pty.Linux
                 result.Process.FinishReapingFromFallback(result.ExitCode, result.Failure);
             }
 
+            if (this.fallbackReapedBatch.Count != 0)
+            {
+                this.fallbackRoundReaped = true;
+            }
+
+            // Retaining the final round's states in a process-lifetime list would keep them
+            // reachable forever.
+            this.fallbackReapedBatch.Clear();
+
             if (this.fallbackProcesses.Count == 0)
             {
                 this.fallbackScanCursor = 0;
@@ -860,22 +888,25 @@ namespace Porta.Pty.Linux
                 this.fallbackScanCursor %= this.fallbackProcesses.Count;
             }
 
-            if (visits < count)
+            this.fallbackScanRoundRemaining -= visits;
+            if (this.fallbackScanRoundRemaining > 0)
             {
-                // Children past the batch cap went unvisited this fire; scan them promptly.
+                // Unvisited children of this round are scanned promptly, but only a completed
+                // round may grow the idle backoff.
                 this.fallbackPollIntervalMilliseconds = FallbackBasePollMilliseconds;
             }
             else
             {
                 // A registration during this scan already reset the interval; growing now would undo it.
-                this.fallbackPollIntervalMilliseconds = reaped.Count != 0 || this.fallbackRegistered
-                    ? FallbackBasePollMilliseconds
-                    : Math.Min(
-                        this.fallbackPollIntervalMilliseconds * FallbackPollGrowthFactor,
-                        FallbackMaxPollMilliseconds);
+                this.fallbackPollIntervalMilliseconds =
+                    this.fallbackRoundReaped || this.fallbackRegistered
+                        ? FallbackBasePollMilliseconds
+                        : Math.Min(
+                            this.fallbackPollIntervalMilliseconds * FallbackPollGrowthFactor,
+                            FallbackMaxPollMilliseconds);
+                this.fallbackRegistered = false;
+                this.fallbackRoundReaped = false;
             }
-
-            this.fallbackRegistered = false;
 
             if (this.fallbackProcesses.Count != 0)
             {
@@ -884,6 +915,19 @@ namespace Porta.Pty.Linux
             }
 
             this.CloseExternalBackendIfIdle();
+        }
+
+        private void ScheduleFallbackScanSoon()
+        {
+            this.fallbackRegistered = true;
+            this.fallbackPollIntervalMilliseconds = FallbackBasePollMilliseconds;
+
+            // A pending scan deadline may be pulled earlier, never pushed later.
+            if (!this.fallbackTimerArmed
+                || Environment.TickCount64 + FallbackBasePollMilliseconds < this.fallbackTimerDeadline)
+            {
+                this.ArmFallbackTimer(FallbackBasePollMilliseconds);
+            }
         }
 
         private void ArmFallbackTimer(int milliseconds)

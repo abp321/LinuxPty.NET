@@ -56,6 +56,21 @@ namespace Porta.Pty.Linux
             }
         }
 
+        /// <summary>
+        /// Pulls the shared reaper's next scan forward when it exists; a null instance owns nothing
+        /// and needs no prompt.
+        /// </summary>
+        internal static void PromptShared()
+        {
+            PtyProcessReaper? instance;
+            lock (SharedGate)
+            {
+                instance = shared;
+            }
+
+            instance?.Prompt();
+        }
+
         internal void Register(PtyProcessState process)
         {
             lock (this.gate)
@@ -76,6 +91,21 @@ namespace Porta.Pty.Linux
                     this.processes.Remove(process);
                     throw;
                 }
+            }
+        }
+
+        private void Prompt()
+        {
+            lock (this.gate)
+            {
+                if (this.processes.Count == 0)
+                {
+                    return;
+                }
+
+                this.pollIntervalMilliseconds = BasePollIntervalMilliseconds;
+                this.registered = true;
+                this.wakeEvent.Set();
             }
         }
 

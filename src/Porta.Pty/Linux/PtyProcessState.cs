@@ -68,6 +68,9 @@ namespace Porta.Pty.Linux
 
         internal int SendSignal(int signal)
         {
+            int error;
+            bool promptFallback;
+            EpollReactor? owner;
             lock (this.reapGate)
             {
                 if (this.lifetimeState is LifetimeState.Reaping or LifetimeState.Completed)
@@ -77,20 +80,43 @@ namespace Porta.Pty.Linux
 
                 if (this.pidFileDescriptor >= 0)
                 {
-                    if (pty_pidfd_send_signal(this.pidFileDescriptor, signal) == 0)
-                    {
-                        return 0;
-                    }
-
                     // Once a pidfd has identified the child, falling back to kill(pid)
                     // could target a reused PID after external reaping.
-                    return Marshal.GetLastPInvokeError();
+                    error = pty_pidfd_send_signal(this.pidFileDescriptor, signal) == 0
+                        ? 0
+                        : Marshal.GetLastPInvokeError();
+                }
+                else
+                {
+                    error = pty_kill(this.pid, signal) == 0
+                        ? 0
+                        : Marshal.GetLastPInvokeError();
                 }
 
-                return pty_kill(this.pid, signal) == 0
-                    ? 0
-                    : Marshal.GetLastPInvokeError();
+                promptFallback = error == 0 && this.lifetimeState == LifetimeState.Fallback;
+                owner = promptFallback ? this.owningReactor : null;
             }
+
+            if (!promptFallback)
+            {
+                return error;
+            }
+
+            // LifetimeState.Fallback does not record whether the reactor or the emergency reaper
+            // owns the child, so both are prompted best-effort, and prompting a non-owner costs one
+            // bounded early scan. No lock is held across either call.
+            try
+            {
+                owner?.PromptFallbackScan();
+            }
+            catch
+            {
+                // A stopped reactor throws from Post and has already rehomed its fallback children
+                // to the emergency reaper.
+            }
+
+            PtyProcessReaper.PromptShared();
+            return error;
         }
 
         /// <summary>
