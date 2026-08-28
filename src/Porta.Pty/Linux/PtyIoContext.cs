@@ -567,8 +567,11 @@ namespace Porta.Pty.Linux
 
         private async Task RetireInlineOwnersAsync()
         {
-            await this.RetireReadInlineOwnerAsync().ConfigureAwait(false);
-            await this.RetireWriteInlineOwnerAsync().ConfigureAwait(false);
+            // The two owners retire concurrently: their state is disjoint.
+            Task retireReads = this.RetireReadInlineOwnerAsync();
+            Task retireWrites = this.RetireWriteInlineOwnerAsync();
+            await retireReads.ConfigureAwait(false);
+            await retireWrites.ConfigureAwait(false);
         }
 
         private async Task StopAfterRetirementAsync(Task retire)
@@ -1340,7 +1343,7 @@ namespace Porta.Pty.Linux
                     return;
                 }
 
-                CancellationTokenRegistration registration = this.CancellationToken.Register(
+                CancellationTokenRegistration registration = this.CancellationToken.UnsafeRegister(
                     static state => ((IoOperation)state!).CancellationCallback(),
                     this);
 
@@ -1363,7 +1366,10 @@ namespace Porta.Pty.Linux
                 }
 
                 this.OnCompletionClaimed();
-                registration = this.TryTakeRegistration() ? this.cancellationRegistration : default;
+                // An uncancellable operation never assigns a registration, so the claim CAS would be dead work on the common CancellationToken.None path.
+                registration = this.CancellationToken.CanBeCanceled && this.TryTakeRegistration()
+                    ? this.cancellationRegistration
+                    : default;
                 return true;
             }
 
