@@ -78,10 +78,11 @@ namespace Porta.Pty.Linux
                 return 0;
             }
 
-            return this.context.ReadAsync(memory, CancellationToken.None)
-                .AsTask()
-                .GetAwaiter()
-                .GetResult();
+            ValueTask<int> read = this.context.ReadAsync(memory, CancellationToken.None);
+
+            // The backing IValueTaskSource has no blocking GetResult, so consuming the
+            // ValueTask directly is valid only once completed; otherwise block through AsTask.
+            return read.IsCompleted ? read.GetAwaiter().GetResult() : read.AsTask().GetAwaiter().GetResult();
         }
 
         public override Task<int> ReadAsync(
@@ -130,10 +131,18 @@ namespace Porta.Pty.Linux
                 return;
             }
 
-            this.context.WriteAsync(memory, CancellationToken.None)
-                .AsTask()
-                .GetAwaiter()
-                .GetResult();
+            ValueTask write = this.context.WriteAsync(memory, CancellationToken.None);
+
+            // The backing IValueTaskSource has no blocking GetResult, so consuming the
+            // ValueTask directly is valid only once completed; otherwise block through AsTask.
+            if (write.IsCompleted)
+            {
+                write.GetAwaiter().GetResult();
+            }
+            else
+            {
+                write.AsTask().GetAwaiter().GetResult();
+            }
         }
 
         public override Task WriteAsync(

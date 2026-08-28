@@ -30,6 +30,9 @@ namespace Porta.Pty.Linux
         private int raisedExitCode;
         private int masterClosed;
         private bool isDisposed;
+
+        // Written under lifetimeGate by Kill and read by DisposeCoreAsync, which starts synchronously inside DisposeAsync's lock on the same gate, so the handoff is ordered.
+        private bool sigkillRequested;
         private Task? disposalTask;
 
         internal PtyConnection(
@@ -113,12 +116,13 @@ namespace Porta.Pty.Linux
             {
                 ObjectDisposedException.ThrowIf(this.isDisposed, this);
                 int error = this.processState.SendSignal(SIGKILL);
-                if (error != 0)
+                if (error == 0)
                 {
-                    if (error != ESRCH)
-                    {
-                        throw new InvalidOperationException($"Killing terminal failed with error {error}");
-                    }
+                    this.sigkillRequested = true;
+                }
+                else if (error != ESRCH)
+                {
+                    throw new InvalidOperationException($"Killing terminal failed with error {error}");
                 }
             }
         }
@@ -192,7 +196,12 @@ namespace Porta.Pty.Linux
 
         private async Task DisposeCoreAsync()
         {
-            this.TryKill(SIGHUP);
+            bool alreadyKilled = this.sigkillRequested;
+            if (!alreadyKilled)
+            {
+                this.TryKill(SIGHUP);
+            }
+
             try
             {
                 await this.ioContext.StopAsync().ConfigureAwait(false);
@@ -202,10 +211,11 @@ namespace Porta.Pty.Linux
                 this.TryCloseMaster();
             }
 
-            if (!this.processState.IsExited)
+            if (!alreadyKilled && !this.processState.IsExited)
             {
                 // SIGHUP preserves the historical cleanup behavior; SIGKILL ensures an
-                // ignored HUP cannot leave async disposal waiting forever.
+                // ignored HUP cannot leave async disposal waiting forever. Both are skipped
+                // when Kill already had a SIGKILL accepted, since SIGKILL cannot be ignored.
                 this.TryKill(SIGKILL);
             }
 
