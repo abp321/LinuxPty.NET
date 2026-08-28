@@ -11,13 +11,19 @@ namespace Porta.Pty
     /// <remarks>
     /// Registrations are one-shot: after a readiness delivery the registration is disarmed and no
     /// further readiness may be delivered until <see cref="UpdateInterests"/> is called again.
-    /// <see cref="IDisposable.Dispose"/> unregisters the descriptor, and no readiness callback may
-    /// run after it returns. The library calls <see cref="UpdateInterests"/> and
-    /// <see cref="IDisposable.Dispose"/> only from within the loop's serialized callback context or
-    /// on a registration that has never been armed, so implementations need no additional
-    /// cross-thread fencing. Arming a registration whose descriptor is already ready must deliver
-    /// that readiness promptly; the library re-arms instead of re-probing and depends on no
-    /// readiness being lost.
+    /// <see cref="IDisposable.Dispose"/> unregisters the descriptor: no new readiness callback may
+    /// begin after it returns. The library may dispose a registration from inside a readiness
+    /// callback, including the registration's own, so Dispose must not wait for the current
+    /// callback to return; serialized callbacks guarantee no other callback is in flight. The
+    /// library calls <see cref="UpdateInterests"/> and <see cref="IDisposable.Dispose"/> only from
+    /// within the loop's serialized callback context or on a registration that has never been
+    /// armed, so implementations need no additional cross-thread fencing. Callbacks are also
+    /// strictly non-reentrant: neither <see cref="IPtyEventLoop.Register"/> nor
+    /// <see cref="UpdateInterests"/> may invoke a readiness callback inline before returning,
+    /// because the library publishes registration state only after those calls return. Arming a
+    /// registration whose descriptor is already ready must therefore deliver that readiness
+    /// promptly as its own serialized dispatch; the library re-arms instead of re-probing and
+    /// depends on no readiness being lost.
     /// </remarks>
     public interface IPtyFdRegistration : IDisposable
     {

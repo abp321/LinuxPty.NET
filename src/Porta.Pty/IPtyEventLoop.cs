@@ -10,7 +10,11 @@ namespace Porta.Pty
     /// reactor thread.
     /// </summary>
     /// <remarks>
-    /// Readiness callbacks must be serialized and never run concurrently with each other. The loop
+    /// Readiness callbacks must be serialized and never run concurrently with each other, and they
+    /// must never be re-entered: <see cref="Register"/> and
+    /// <see cref="IPtyFdRegistration.UpdateInterests"/> must not invoke a readiness callback inline
+    /// from within the registering or arming call, so an already-ready descriptor's delivery is
+    /// scheduled as its own serialized dispatch. The loop
     /// must keep dispatching until every registration it handed out has been disposed, because
     /// disposal and child reaping complete through callbacks. Synchronous blocking connection
     /// operations (<see cref="IDisposable.Dispose"/>, <see cref="IPtyConnection.WaitForExit"/>, and
