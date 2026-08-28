@@ -17,9 +17,9 @@ namespace Porta.Pty.Linux
         private readonly IPtyEventLoop loop;
         private readonly Dictionary<ulong, IPtyFdRegistration> registrations = new();
         private readonly IPtyFdRegistration wakeRegistration;
-        private readonly IPtyFdRegistration timerRegistration;
+        private IPtyFdRegistration? timerRegistration;
         private readonly int wakeFd;
-        private readonly int timerFd;
+        private int timerFd = -1;
         private bool closed;
 
         internal ExternalReactorBackend(EpollReactor engine, IPtyEventLoop loop)
@@ -33,44 +33,28 @@ namespace Porta.Pty.Linux
                 throw EpollReactor.CreateIOException("Creating the PTY reactor wakeup", wakeError);
             }
 
-            int timerError = pty_timerfd_create(out int timer);
-            if (timerError != 0)
-            {
-                _ = pty_close(wake);
-                throw EpollReactor.CreateIOException(
-                    "Creating the PTY fallback poll timer",
-                    timerError);
-            }
-
             this.wakeFd = wake;
-            this.timerFd = timer;
 
             IPtyFdRegistration? createdWake = null;
-            IPtyFdRegistration? createdTimer = null;
             try
             {
-                // Both registrations start unarmed: a never-armed one-shot registration has no
-                // callback in flight, so the rollback below may dispose them from this thread.
+                // The registration starts unarmed: a never-armed one-shot registration has no
+                // callback in flight, so the rollback below may dispose it from this thread.
                 this.wakeRegistration = createdWake =
                     loop.Register(wake, PtyFdInterests.None, _ => this.OnWakeReady());
-                this.timerRegistration = createdTimer =
-                    loop.Register(timer, PtyFdInterests.None, _ => this.OnTimerReady());
                 createdWake.UpdateInterests(PtyFdInterests.Read);
             }
             catch
             {
                 try
                 {
-                    // Per-item tolerance, as in Close: a throwing caller Dispose must not skip the
-                    // other rollback disposal nor replace the setup exception rethrown below.
-                    TryDispose(createdTimer);
+                    // A throwing caller Dispose must not replace the setup exception rethrown below.
                     TryDispose(createdWake);
                 }
                 finally
                 {
-                    // The descriptors are this backend's alone, so a caller registration that
-                    // throws from Dispose must not leak them.
-                    _ = pty_close(timer);
+                    // The descriptor is this backend's alone, so a caller registration that
+                    // throws from Dispose must not leak it.
                     _ = pty_close(wake);
                 }
 
@@ -107,6 +91,31 @@ namespace Porta.Pty.Linux
 
         public int ArmTimer(int milliseconds)
         {
+            if (this.timerFd < 0)
+            {
+                // The timer serves only fallback reaping, so a pidfd-capable connection never
+                // creates it. A throwing caller Register must not leak the descriptor, and the
+                // field is assigned only once registration succeeded so a failed attempt retries.
+                int createError = pty_timerfd_create(out int timer);
+                if (createError != 0)
+                {
+                    return createError;
+                }
+
+                try
+                {
+                    this.timerRegistration =
+                        this.loop.Register(timer, PtyFdInterests.None, _ => this.OnTimerReady());
+                }
+                catch
+                {
+                    _ = pty_close(timer);
+                    throw;
+                }
+
+                this.timerFd = timer;
+            }
+
             int error = pty_reactor_set_timer(this.timerFd, milliseconds);
             if (error != 0)
             {
@@ -114,7 +123,7 @@ namespace Porta.Pty.Linux
             }
 
             // A one-shot delivery disarms the timer registration, so every arm must re-arm it.
-            this.timerRegistration.UpdateInterests(PtyFdInterests.Read);
+            this.timerRegistration!.UpdateInterests(PtyFdInterests.Read);
             return 0;
         }
 
@@ -160,7 +169,11 @@ namespace Porta.Pty.Linux
             }
             finally
             {
-                _ = pty_close(this.timerFd);
+                if (this.timerFd >= 0)
+                {
+                    _ = pty_close(this.timerFd);
+                }
+
                 _ = pty_close(this.wakeFd);
             }
         }
