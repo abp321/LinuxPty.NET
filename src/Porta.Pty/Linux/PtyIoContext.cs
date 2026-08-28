@@ -30,7 +30,7 @@ namespace Porta.Pty.Linux
         private const int StaleHandoffMicroseconds = 80;
 
         // A parked operation completes at this much so one busy descriptor cannot hold the reactor for a full 64 KB fill while a small ready read waits; the consumer's next read drains the rest inline.
-        private const int ReactorFillQuantum = 4 * 1024;
+        private const int ReactorFillQuantum = 2 * 1024;
 
         private const int MaxWriteSize = 16 * 1024;
         private const int InlineFree = 0;
