@@ -38,10 +38,13 @@ namespace Porta.Pty.Linux
         private readonly HashSet<PtyIoContext> contexts = new();
         private readonly HashSet<PtyProcessState> processes = new();
         private readonly List<PtyProcessState> fallbackProcesses = new();
+        private readonly ReactorCommand[] drainBatch = new ReactorCommand[MaxCommandsPerDrain];
         private readonly unsafe PtyReactorEvent* events;
         private readonly Thread? thread;
         private readonly bool isExternal;
         private long nextToken;
+        private int drainBatchCount;
+        private int drainBatchNext;
         private int fallbackPollIntervalMilliseconds = FallbackBasePollMilliseconds;
         private int fallbackScanCursor;
         private bool fallbackTimerArmed;
@@ -400,7 +403,19 @@ namespace Porta.Pty.Linux
         /// </summary>
         internal void ExternalWake()
         {
-            this.RunExternalEntry(this.DrainCommandsAndResignal);
+            if (this.IsStopped)
+            {
+                return;
+            }
+
+            try
+            {
+                this.DrainCommandsAndResignal();
+            }
+            catch (Exception exception)
+            {
+                this.FailReactor(exception);
+            }
         }
 
         /// <summary>
@@ -408,7 +423,12 @@ namespace Porta.Pty.Linux
         /// </summary>
         internal void ExternalReadiness(ulong token, uint nativeEvents)
         {
-            this.RunExternalEntry(() =>
+            if (this.IsStopped)
+            {
+                return;
+            }
+
+            try
             {
                 // Cancellation and disposal commands win before readiness is dispatched to a
                 // descriptor, exactly as the batch loop orders them.
@@ -424,7 +444,11 @@ namespace Porta.Pty.Linux
                 {
                     this.ProcessExitReady(process, token);
                 }
-            });
+            }
+            catch (Exception exception)
+            {
+                this.FailReactor(exception);
+            }
         }
 
         /// <summary>
@@ -432,12 +456,21 @@ namespace Porta.Pty.Linux
         /// </summary>
         internal void ExternalTimer()
         {
-            this.RunExternalEntry(() =>
+            if (this.IsStopped)
+            {
+                return;
+            }
+
+            try
             {
                 this.DrainCommandsAndResignal();
                 this.fallbackTimerArmed = false;
                 this.ScanFallbackProcesses();
-            });
+            }
+            catch (Exception exception)
+            {
+                this.FailReactor(exception);
+            }
         }
 
         /// <summary>
@@ -461,7 +494,7 @@ namespace Porta.Pty.Linux
             try
             {
                 // Teardown must run in the loop's serialized callback context, so the failure is
-                // marshalled as a command whose throw takes the same RunExternalEntry to
+                // marshalled as a command whose throw takes the same external entry catch to
                 // FailReactor path a faulty dispatch takes. The wake registration is armed here
                 // (the callback that faulted the registration command re-armed it), so the command
                 // is drained promptly. A Post that throws means the engine already failed and
@@ -547,8 +580,17 @@ namespace Porta.Pty.Linux
             lock (this.commandGate)
             {
                 this.fatalError = exception;
-                abandonedCommands = this.commands.ToArray();
+
+                // The unexecuted drain remainder precedes the queue so a mid-drain throw still
+                // fans its commands out in their original order.
+                int remaining = this.drainBatchCount - this.drainBatchNext;
+                abandonedCommands = new ReactorCommand[remaining + this.commands.Count];
+                Array.Copy(this.drainBatch, this.drainBatchNext, abandonedCommands, 0, remaining);
+                this.commands.CopyTo(abandonedCommands, remaining);
                 this.commands.Clear();
+                Array.Clear(this.drainBatch, 0, this.drainBatchCount);
+                this.drainBatchCount = 0;
+                this.drainBatchNext = 0;
             }
 
             if (!this.isExternal)
@@ -635,11 +677,11 @@ namespace Porta.Pty.Linux
             // callback is owed and the caller's loop can be released.
             lock (this.commandGate)
             {
-                if (this.commands.Count != 0)
+                if (this.commands.Count != 0 || this.drainBatchNext < this.drainBatchCount)
                 {
-                    // A queued command is live work (a declined-reap fallback handoff, say). The
-                    // wake registration is still armed, so it drains and the drain re-evaluates
-                    // idleness once the queue empties.
+                    // A queued or batched-but-unexecuted command is live work (a declined-reap
+                    // fallback handoff, say). The wake registration is still armed, so it drains
+                    // and the drain re-evaluates idleness once the queue empties.
                     return;
                 }
 
@@ -647,23 +689,6 @@ namespace Porta.Pty.Linux
             }
 
             this.backend.Close();
-        }
-
-        private void RunExternalEntry(Action entry)
-        {
-            if (this.IsStopped)
-            {
-                return;
-            }
-
-            try
-            {
-                entry();
-            }
-            catch (Exception exception)
-            {
-                this.FailReactor(exception);
-            }
         }
 
         private void Execute(ReactorCommand command)
@@ -739,27 +764,38 @@ namespace Porta.Pty.Linux
 
         private void DrainCommandsAndResignal()
         {
-            int processed = 0;
-            while (processed < MaxCommandsPerDrain)
-            {
-                ReactorCommand command;
-                lock (this.commandGate)
-                {
-                    if (!this.commands.TryDequeue(out command))
-                    {
-                        break;
-                    }
-                }
-
-                this.Execute(command);
-                processed++;
-            }
-
             bool commandsRemain;
             lock (this.commandGate)
             {
+                int captured = 0;
+                while (captured < MaxCommandsPerDrain
+                    && this.commands.TryDequeue(out ReactorCommand queued))
+                {
+                    this.drainBatch[captured] = queued;
+                    captured++;
+                }
+
+                this.drainBatchCount = captured;
+                this.drainBatchNext = 0;
+
+                // Snapshotting the remainder here is safe: a command posted during batch
+                // execution found an empty queue under this gate and woke the reactor itself.
                 commandsRemain = this.commands.Count != 0;
             }
+
+            while (this.drainBatchNext < this.drainBatchCount)
+            {
+                ReactorCommand command = this.drainBatch[this.drainBatchNext];
+
+                // Advance before executing so a throwing command is never re-executed and never
+                // counts as pending work.
+                this.drainBatchNext++;
+                this.Execute(command);
+            }
+
+            Array.Clear(this.drainBatch, 0, this.drainBatchCount);
+            this.drainBatchCount = 0;
+            this.drainBatchNext = 0;
 
             if (commandsRemain)
             {
