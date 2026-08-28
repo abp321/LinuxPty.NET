@@ -82,42 +82,51 @@ namespace Porta.Pty.Linux
             public uint Reserved;
         }
 
-        internal static unsafe PtySpawnResult pty_spawn(
+        internal static unsafe PtySpawnArguments PrepareSpawnArguments(
             string file,
             string?[] argv,
             string?[] inheritedEnvironment,
             string?[]? environmentMutations,
-            string? workingDir,
-            ushort rows,
-            ushort cols)
+            string? workingDir)
         {
-            byte** nativeArgv = null;
-            byte** nativeInherited = null;
-            byte** nativeMutations = null;
+            var arguments = new PtySpawnArguments();
             try
             {
-                nativeArgv = AllocateStringArray(argv);
-                nativeInherited = AllocateStringArray(inheritedEnvironment);
+                arguments.File = AllocateUtf8(file);
+                arguments.ArgvLength = argv.Length;
+                arguments.Argv = AllocateStringArray(argv);
+                arguments.InheritedLength = inheritedEnvironment.Length;
+                arguments.InheritedEnvironment = AllocateStringArray(inheritedEnvironment);
                 if (environmentMutations is not null)
                 {
-                    nativeMutations = AllocateStringArray(environmentMutations);
+                    arguments.MutationsLength = environmentMutations.Length;
+                    arguments.EnvironmentMutations = AllocateStringArray(environmentMutations);
                 }
 
-                return PtySpawnCore(
-                    file,
-                    nativeArgv,
-                    nativeInherited,
-                    nativeMutations,
-                    workingDir,
-                    rows,
-                    cols);
+                if (workingDir is not null)
+                {
+                    arguments.WorkingDir = AllocateUtf8(workingDir);
+                }
+
+                return arguments;
             }
-            finally
+            catch
             {
-                FreeStringArray(nativeMutations, environmentMutations?.Length ?? 0);
-                FreeStringArray(nativeInherited, inheritedEnvironment.Length);
-                FreeStringArray(nativeArgv, argv.Length);
+                arguments.Dispose();
+                throw;
             }
+        }
+
+        internal static unsafe PtySpawnResult pty_spawn(PtySpawnArguments arguments, ushort rows, ushort cols)
+        {
+            return PtySpawnCore(
+                arguments.File,
+                arguments.Argv,
+                arguments.InheritedEnvironment,
+                arguments.EnvironmentMutations,
+                arguments.WorkingDir,
+                rows,
+                cols);
         }
 
         [LibraryImport(LibPortaPty, SetLastError = true)]
@@ -193,13 +202,13 @@ namespace Porta.Pty.Linux
             int length,
             out int transferred);
 
-        [LibraryImport(LibPortaPty, EntryPoint = "pty_spawn", StringMarshalling = StringMarshalling.Utf8)]
+        [LibraryImport(LibPortaPty, EntryPoint = "pty_spawn")]
         private static unsafe partial PtySpawnResult PtySpawnCore(
-            string file,
+            byte* file,
             byte** argv,
             byte** inheritedEnvironment,
             byte** environmentMutations,
-            string? workingDir,
+            byte* workingDir,
             ushort rows,
             ushort cols);
 
@@ -249,6 +258,32 @@ namespace Porta.Pty.Linux
             }
 
             NativeMemory.Free(native);
+        }
+
+        internal sealed unsafe class PtySpawnArguments : IDisposable
+        {
+            internal byte* File;
+            internal byte** Argv;
+            internal int ArgvLength;
+            internal byte** InheritedEnvironment;
+            internal int InheritedLength;
+            internal byte** EnvironmentMutations;
+            internal int MutationsLength;
+            internal byte* WorkingDir;
+
+            public void Dispose()
+            {
+                FreeStringArray(this.EnvironmentMutations, this.MutationsLength);
+                this.EnvironmentMutations = null;
+                FreeStringArray(this.InheritedEnvironment, this.InheritedLength);
+                this.InheritedEnvironment = null;
+                FreeStringArray(this.Argv, this.ArgvLength);
+                this.Argv = null;
+                NativeMemory.Free(this.File);
+                this.File = null;
+                NativeMemory.Free(this.WorkingDir);
+                this.WorkingDir = null;
+            }
         }
     }
 }

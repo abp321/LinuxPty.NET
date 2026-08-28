@@ -19,7 +19,11 @@ namespace Porta.Pty.Linux
     {
         // The native pty_spawn already serializes across callers with a process-wide
         // mutex; this gate only bounds the managed side to one pool worker at a time,
-        // and covers only the synchronous native spawn section below.
+        // and covers only the synchronous native spawn section below. Argument
+        // encoding and vector allocation stay outside it: they are pure per-call work
+        // that would otherwise extend the serialized section, the memory is native so
+        // the forked child touches nothing managed, and disposing after the gate also
+        // covers cancellation thrown while queued on the wait.
         private static readonly SemaphoreSlim SpawnGate = new(1, 1);
 
         internal static async Task<IPtyConnection> StartTerminalAsync(
@@ -36,22 +40,29 @@ namespace Porta.Pty.Linux
             // synchronous native spawn call.
             string?[] inheritedEnvironment = GetInheritedEnvironment();
 
-            await SpawnGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            PtySpawnArguments spawnArguments = PrepareSpawnArguments(
+                options.App,
+                terminalArgs,
+                inheritedEnvironment,
+                environmentMutations,
+                options.Cwd);
+
             PtySpawnResult result;
             try
             {
-                result = pty_spawn(
-                    options.App,
-                    terminalArgs,
-                    inheritedEnvironment,
-                    environmentMutations,
-                    options.Cwd,
-                    (ushort)options.Rows,
-                    (ushort)options.Cols);
+                await SpawnGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    result = pty_spawn(spawnArguments, (ushort)options.Rows, (ushort)options.Cols);
+                }
+                finally
+                {
+                    SpawnGate.Release();
+                }
             }
             finally
             {
-                SpawnGate.Release();
+                spawnArguments.Dispose();
             }
 
             if (result.Pid == -1)
