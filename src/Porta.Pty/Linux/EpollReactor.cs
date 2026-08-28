@@ -889,11 +889,13 @@ namespace Porta.Pty.Linux
             }
 
             this.fallbackScanRoundRemaining -= visits;
+            int nextFireDelayMilliseconds;
             if (this.fallbackScanRoundRemaining > 0)
             {
                 // Unvisited children of this round are scanned promptly, but only a completed
-                // round may grow the idle backoff.
-                this.fallbackPollIntervalMilliseconds = FallbackBasePollMilliseconds;
+                // round may grow the idle backoff. The stored interval is round-to-round backoff
+                // state, so a mid-round fire must not reset it.
+                nextFireDelayMilliseconds = FallbackBasePollMilliseconds;
             }
             else
             {
@@ -906,11 +908,12 @@ namespace Porta.Pty.Linux
                             FallbackMaxPollMilliseconds);
                 this.fallbackRegistered = false;
                 this.fallbackRoundReaped = false;
+                nextFireDelayMilliseconds = this.fallbackPollIntervalMilliseconds;
             }
 
             if (this.fallbackProcesses.Count != 0)
             {
-                this.ArmFallbackTimer(this.fallbackPollIntervalMilliseconds);
+                this.ArmFallbackTimer(nextFireDelayMilliseconds);
                 return;
             }
 
